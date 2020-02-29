@@ -1,0 +1,258 @@
+package main
+
+import (
+	"SecureForwarder/crypt"
+	"crypto/rsa"
+	"crypto/sha256"
+	"errors"
+	"github.com/gorilla/websocket"
+	log "github.com/sirupsen/logrus"
+	"github.com/urfave/cli/v2"
+	"os"
+	"strings"
+)
+
+var upgrader = websocket.Upgrader{}
+
+//var IdAndKeys map[string][]byte
+
+var (
+	To               string // where the traffic should be forwarded. Server address in client and destination in server application
+	Port             string // the port that the client or server listens on
+	InterfaceAddress string // where should we bind the proxy?
+	Password         string // the password of the user. Plaintext
+	TransferType     string // how the data should be transferred; tcp,ws,wss
+	Encryption       string // the encryption type; xor,aes,chacha
+	KeyAgreement     string // key agreement algorithm
+	BufferSize       int    // buffer size of the server. SERVER AND CLIENT SHOULD HAVE SAME VALUE ON TCP MODE
+	Loglevel         string // how much logs should be shown to user
+	CertPath         string // tls cert path; Used only with wss connections
+	KeyPath          string // tls key path; Used only with wss connections
+	ServerApp        bool   // is this running as server application
+)
+
+var (
+	RSAPublicPem  []byte
+	RSAPrivateKey *rsa.PrivateKey
+)
+
+const VERSION = "1.0.0 / Build 1"
+
+func main() {
+	app := &cli.App{
+		Name:        "Secure Forwarder",
+		Usage:       "Forward your encrypted packets",
+		Version:     VERSION,
+		Description: "Securely forwards your data over the internet.",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:        "to",
+				Usage:       "Where these packets should be forwarded?",
+				Required:    true,
+				Destination: &To,
+			},
+			&cli.StringFlag{
+				Name:        "port",
+				Usage:       "The port that the proxy should listen on",
+				Required:    true,
+				Destination: &Port,
+			},
+			&cli.StringFlag{
+				Name:        "interface",
+				Usage:       "The address that the proxy should listen on",
+				Required:    false,
+				DefaultText: "localhost on client and 0.0.0.0 on server",
+				Destination: &InterfaceAddress,
+			},
+			&cli.StringFlag{
+				Name:        "password",
+				Aliases:     []string{"p"},
+				Usage:       "The password of the proxy",
+				Required:    true,
+				Destination: &Password,
+			},
+			&cli.StringFlag{
+				Name:        "encryption",
+				Aliases:     []string{"e"},
+				Usage:       "The encryption type: (xor,aes,chacha)",
+				Required:    false,
+				Value:       "chacha",
+				Destination: &Encryption,
+			},
+			&cli.StringFlag{
+				Name:        "type",
+				Aliases:     []string{"t"},
+				Usage:       "The forward type: (tcp,ws,wss)",
+				Required:    false,
+				Value:       "tcp",
+				Destination: &TransferType,
+			},
+			&cli.StringFlag{
+				Name:        "agreement",
+				Usage:       "Key agreement type for connections. Use only encryption is aes or chacha. (sha-256,x25519,pbkdf2,scrypt,argon2)",
+				Required:    false,
+				Value:       "pbkdf2",
+				Destination: &KeyAgreement,
+			},
+			&cli.IntFlag{
+				Name:        "buffer",
+				Usage:       "Buffer size if the proxy is running in TCP mode; SERVER AND CLIENT SHOULD HAVE SAME VALUE ON TCP MODE",
+				Required:    false,
+				Value:       1024 * 32,
+				Destination: &BufferSize,
+			},
+			&cli.StringFlag{
+				Name:        "loglevel",
+				Usage:       "Log level (trace,debug,info,warn,error,fatal,panic)",
+				Required:    false,
+				Value:       "info",
+				Destination: &Loglevel,
+			},
+		},
+		Commands: []*cli.Command{
+			{
+				Name:    "server",
+				Aliases: []string{"s"},
+				Flags: []cli.Flag{
+					&cli.PathFlag{
+						Name:        "cert",
+						Usage:       "Certificate if you are using wss",
+						Required:    false,
+						Value:       "cert.pem",
+						Destination: &CertPath,
+					},
+					&cli.PathFlag{
+						Name:        "key",
+						Usage:       "Key of certificate if you are using wss",
+						Required:    false,
+						Value:       "key.pem",
+						Destination: &KeyPath,
+					},
+				},
+				Usage: "run as server application",
+				Action: func(c *cli.Context) error {
+					ServerApp = true
+					err := FixAndCheckArguments()
+					if err != nil {
+						return err
+					}
+					// at first do some pre calculations
+					if KeyAgreement == "sha-256" {
+						hashed := sha256.Sum256([]byte(Password))
+						Password = string(hashed[:]) // you might think why this guy is converting a binary data to string? If I used []byte, when I would have used bytes.Equal that this function does in fact convert byte slices to string
+					}
+					// start listening according to type of transfer type
+					switch TransferType {
+					case "tcp": // use raw tcp
+						return TCPStartListen()
+					case "ws": // use unencrypted websocket
+						upgrader.ReadBufferSize = BufferSize
+						upgrader.WriteBufferSize = BufferSize
+					case "wss": // use secure websocket
+						upgrader.ReadBufferSize = BufferSize
+						upgrader.WriteBufferSize = BufferSize
+					}
+					return nil
+				},
+			},
+			{
+				Name:    "client",
+				Aliases: []string{"c"},
+				Usage:   "run as client application",
+				Action: func(c *cli.Context) error {
+					ServerApp = false
+					err := FixAndCheckArguments()
+					if err != nil {
+						return err
+					}
+					// at first do some pre calculations
+					if KeyAgreement == "sha-256" {
+						hashed := sha256.Sum256([]byte(Password))
+						Password = string(hashed[:]) // you might think why this guy is converting a binary data to string? If I used []byte, when I would have used bytes.Equal that this function does in fact convert byte slices to string
+					}
+					// start listening according to type of transfer type
+					switch TransferType {
+					case "tcp": // use raw tcp
+						return TCPStartListen()
+					case "ws": // use unencrypted websocket
+						upgrader.ReadBufferSize = BufferSize
+						upgrader.WriteBufferSize = BufferSize
+					case "wss": // use secure websocket
+						upgrader.ReadBufferSize = BufferSize
+						upgrader.WriteBufferSize = BufferSize
+					}
+					return nil
+				},
+			},
+		},
+	}
+
+	err := app.Run(os.Args)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+// check and fix arguments
+func FixAndCheckArguments() error {
+	// at first all of the methods must be in lowercase
+	Encryption = strings.ToLower(Encryption)
+	TransferType = strings.ToLower(TransferType)
+	KeyAgreement = strings.ToLower(KeyAgreement)
+	Loglevel = strings.ToLower(Loglevel)
+	// set loglevel
+	switch Loglevel {
+	case "trace":
+		log.Info("Log level set on trace.")
+		log.SetLevel(log.TraceLevel)
+	case "debug":
+		log.Info("Log level set on debug.")
+		log.SetLevel(log.DebugLevel)
+	case "info":
+		log.SetLevel(log.InfoLevel)
+	case "warn":
+		log.SetLevel(log.WarnLevel)
+	case "error":
+		log.SetLevel(log.ErrorLevel)
+	case "fatal":
+		log.SetLevel(log.FatalLevel)
+	case "panic":
+		log.SetLevel(log.PanicLevel)
+	}
+	// check encryption type
+	if !StringArrayContains([]string{"xor", "aes", "chacha"}, Encryption) {
+		return errors.New("undefined encryption type")
+	}
+	if !StringArrayContains([]string{"sha-256", "x25519", "pbkdf2", "scrypt", "argon2"}, KeyAgreement) {
+		return errors.New("undefined key agreement method type")
+	}
+	if !StringArrayContains([]string{"tcp", "ws", "wss"}, TransferType) {
+		return errors.New("undefined forward method type")
+	}
+	// fix interface
+	if InterfaceAddress == "" {
+		if ServerApp {
+			InterfaceAddress = "0.0.0.0"
+		} else {
+			InterfaceAddress = "localhost"
+		}
+	}
+	// generate RSA keys if needed
+	if ServerApp && KeyAgreement != "sha-256" && KeyAgreement != "pbkdf2" {
+		log.Info("Generating a RSA-2048 key pair")
+		RSAPrivateKey = crypt.RSAGenerateKeyPair(2048)
+		RSAPublicPem = crypt.RSAPublicKeyToBytes(&RSAPrivateKey.PublicKey)
+		log.Info("Done generating a RSA-2048 key pair")
+	}
+	return nil
+}
+
+// checks if a string array contains an element
+func StringArrayContains(array []string, toCheck string) bool {
+	for _, v := range array {
+		if v == toCheck {
+			return true
+		}
+	}
+	return false
+}
