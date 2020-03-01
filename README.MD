@@ -2,9 +2,9 @@
 **I want to bypass censorship**
 * Transfer Mode: ***Always use `wss`***. Try to issue a valid certificate. For example you can use [certbot](https://certbot.eff.org/).
 * Encryption: ChaCha20
-* KeyAgreement: PBKDF2 or SHA-256
+* KeyAgreement: SHA-256 or PBKDF2
 
-If websocket is not available, use tcp but do not change key agreement algorithm.
+If websocket is not available, it's good to use SHA-256 as key agreement because it does not have a handshake. And don't change Encryption method
 
 **I want speed**
 * Transfer Mode: TCP

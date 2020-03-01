@@ -48,6 +48,26 @@ func TCPStartListen() error {
 func TCPHandleForwardServer(conn net.Conn) { // forward all connections
 	defer conn.Close()
 	var err error
+	salt := make([]byte, 8)
+	var key []byte // is always 256 bit
+
+	// check the id for these algorithms
+	if KeyAgreement == "pbkdf2" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // check the id map
+		_, err = conn.Read(salt) // we temporary use salt
+		if err != nil {
+			log.Error("Cannot read id from client: ", err.Error())
+			return
+		}
+		// check if this a handshake packet or client is using an id; Handshake packet starts with 0 in binary. However id always starts with 1
+		if salt[0]&128 == 128 { // 128 = 10000000 in binary; 1 means id; Check the id
+			if k, exists := IdAndKeys.Get(string(salt)); exists {
+				key = k.([]byte) // key is always a byte array
+				goto startTransfer
+			}
+		}
+		// otherwise just continue to handshake
+	}
+
 	// perform the handshake
 	if KeyAgreement == "x25519" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" {
 		_, err = conn.Write(RSAPublicPem) // on client we use big buffer (8*1024) because in future I might add something to change the key size
@@ -77,8 +97,6 @@ func TCPHandleForwardServer(conn net.Conn) { // forward all connections
 	}
 	// if code reaches here, the handshake was ok!
 	// generate a salt for key derivation it's not used in sha-256 and x25519
-	salt := make([]byte, 8)
-	var key []byte // is always 256 bit
 	// generate the key derivation if needed
 	switch KeyAgreement {
 	case "sha-256":
@@ -148,6 +166,27 @@ func TCPHandleForwardServer(conn net.Conn) { // forward all connections
 		// generate the key
 		key = argon2.IDKey([]byte(Password), salt, 10, 1<<14, 2, 32)
 	}
+
+	// save the data in map
+	{
+		// we reuse salt; generate a random id for user
+		_, _ = rand.Read(salt)
+		salt[0] |= 128
+		_, err = conn.Write(salt) // send the id to client
+		if err != nil {
+			log.Error("Cannot send id to client: ", err.Error())
+			return
+		}
+		IdAndKeys.Set(string(salt), key) // save it
+		log.WithFields(log.Fields{
+			"address": conn.RemoteAddr(),
+			"id":      base64.StdEncoding.EncodeToString(salt),
+			"key":     base64.StdEncoding.EncodeToString(key),
+		}).Trace("New handshake")
+	}
+	return // do not start coping
+
+startTransfer:
 	// dial the destination
 	proxy, err := net.Dial("tcp", To)
 	if err != nil {
@@ -186,8 +225,21 @@ func TCPHandleForwardClient(conn net.Conn) {
 	}
 	defer srv.Close()
 
+	var key []byte // is always 256 bit
+
+	// this means that the key must be in the idAndKeys
+	for item := range IdAndKeys.IterBuffered() {
+		log.Trace(base64.StdEncoding.EncodeToString([]byte(item.Key)), " -> ", base64.StdEncoding.EncodeToString(item.Val.([]byte)))
+		_, err = srv.Write([]byte(item.Key))
+		if err != nil {
+			log.Error("cannot send the id to server", err.Error())
+			return
+		}
+		key = item.Val.([]byte)
+	}
+
 	// do the key agreement
-	if KeyAgreement == "x25519" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // in theses methods we should get the RSA key and encrypt out password with it
+	if KeyAgreement == "x25519" { // in theses methods we should get the RSA key and encrypt out password with it
 		rsaPem := make([]byte, 1024*4)     // 16384 bit RSA is 2880 bytes. Just make sure that there is enough buffer to read the key
 		readCount, err := srv.Read(rsaPem) // read the RSA public key
 		if err != nil {
@@ -215,7 +267,6 @@ func TCPHandleForwardClient(conn net.Conn) {
 
 	// get the key
 	salt := make([]byte, 8)
-	var key []byte // is always 256 bit
 	switch KeyAgreement {
 	case "sha-256":
 		key = []byte(Password) // that's it :D
@@ -245,34 +296,6 @@ func TCPHandleForwardClient(conn net.Conn) {
 			log.Error("Cannot do the final key agreement: ", err.Error())
 			return
 		}
-	case "pbkdf2":
-		// server sends a 8 byte salt to us
-		_, err = srv.Read(salt)
-		if err != nil {
-			log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
-			return
-		}
-		// generate shared key
-		key = pbkdf2.Key([]byte(Password), salt, 1024*16, 32, sha1.New)
-	case "scrypt":
-		// server sends a 8 byte salt to us
-		_, err = srv.Read(salt)
-		if err != nil {
-			log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
-			return
-		}
-		// generate shared key
-		key, err = scrypt.Key([]byte(Password), salt, 1<<14, 8, 1, 32)
-	case "argon2":
-		// server sends a 16 byte salt to us
-		salt = make([]byte, 16)
-		_, err = srv.Read(salt)
-		if err != nil {
-			log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
-			return
-		}
-		// generate shared key
-		key = argon2.IDKey([]byte(Password), salt, 10, 1<<14, 2, 32)
 	}
 
 	log.Trace("Key is ", base64.StdEncoding.EncodeToString(key), " for ", srv.LocalAddr())
