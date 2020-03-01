@@ -313,8 +313,8 @@ func TCPHandleForwardClient(conn net.Conn) {
 	}()
 	err = TCPCopyConnectionEncrypt(conn, srv, key) // client -> server ; must be encrypted. Use default buffer size
 	mu.Lock()                                      // wait until mutex is free; no need to unlock. It will be gone with GC
-	if err != nil {
-		log.Debug("Error on copy (server -> client): ", err.Error())
+	if err2 != nil {
+		log.Debug("Error on copy (server -> client): ", err2.Error())
 	}
 	if err != nil {
 		log.Debug("Error on copy (client -> server): ", err.Error())
@@ -411,7 +411,7 @@ func TCPCopyConnectionDecrypt(src, dst net.Conn, key []byte) (err error) {
 	if Encryption != "xor" {
 		bufferSize += 28 // nonce + tag size: 12 + 16 = 28
 	}
-	buf := make([]byte, BufferSize)
+	buf := make([]byte, bufferSize)
 	if Encryption == "xor" { // this is only for performance. Once for all define if you we are going to use AEAD interface or xor
 		for {
 			nr, er = src.Read(buf)
@@ -462,7 +462,7 @@ func TCPCopyConnectionDecrypt(src, dst net.Conn, key []byte) (err error) {
 			if nr > 0 {
 				plainText, err = c.Open(nil, buf[:12], buf[12:nr], nil)
 				if err != nil {
-					log.Error("Error on decrypting data")
+					log.Error("Error on decrypting data: ", err.Error())
 					src.Close()
 					dst.Close()
 					return err
