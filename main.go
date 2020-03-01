@@ -148,7 +148,7 @@ func main() {
 					if KeyAgreement == "sha-256" {
 						hashed := sha256.Sum256([]byte(Password))
 						Password = string(hashed[:]) // you might think why this guy is converting a binary data to string? If I used []byte, when I would have used bytes.Equal that this function does in fact convert byte slices to string
-						log.Trace("Key is ", base64.StdEncoding.EncodeToString([]byte(Password)))
+						log.Trace("Key is ", base64.StdEncoding.EncodeToString(hashed[:]))
 					}
 					// log
 					log.WithFields(log.Fields{
@@ -185,6 +185,7 @@ func main() {
 					if KeyAgreement == "sha-256" {
 						hashed := sha256.Sum256([]byte(Password))
 						Password = string(hashed[:]) // you might think why this guy is converting a binary data to string? If I used []byte, when I would have used bytes.Equal that this function does in fact convert byte slices to string
+						log.Trace("Key is ", base64.StdEncoding.EncodeToString(hashed[:]))
 					}
 					// log
 					log.WithFields(log.Fields{
