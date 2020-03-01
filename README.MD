@@ -4,7 +4,7 @@
 * Encryption: ChaCha20
 * KeyAgreement: SHA-256 or PBKDF2
 
-If websocket is not available, it's good to use SHA-256 as key agreement because it does not have a handshake. And don't change Encryption method
+If websocket is not available, it's good to use SHA-256 as key agreement because it does not have a handshake. (It's harder to detect it) And don't change Encryption method.
 
 **I want speed**
 * Transfer Mode: TCP

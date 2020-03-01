@@ -97,7 +97,7 @@ func main() {
 			},
 			&cli.StringFlag{
 				Name:        "agreement",
-				Usage:       "Key agreement type for connections. Use only encryption is aes or chacha. (sha-256,x25519,pbkdf2,scrypt,argon2)",
+				Usage:       "Key agreement type for connections. (sha-256,x25519,pbkdf2,scrypt,argon2)",
 				Required:    false,
 				Value:       "pbkdf2",
 				Destination: &KeyAgreement,
@@ -148,7 +148,15 @@ func main() {
 					if KeyAgreement == "sha-256" {
 						hashed := sha256.Sum256([]byte(Password))
 						Password = string(hashed[:]) // you might think why this guy is converting a binary data to string? If I used []byte, when I would have used bytes.Equal that this function does in fact convert byte slices to string
+						log.Trace("Key is ", base64.StdEncoding.EncodeToString([]byte(Password)))
 					}
+					// log
+					log.WithFields(log.Fields{
+						"KeyAgreement": KeyAgreement,
+						"TransferType": TransferType,
+						"Encryption":   Encryption,
+						"Buffer":       BufferSize,
+					}).Debug()
 					// start listening according to type of transfer type
 					switch TransferType {
 					case "tcp": // use raw tcp
@@ -178,6 +186,13 @@ func main() {
 						hashed := sha256.Sum256([]byte(Password))
 						Password = string(hashed[:]) // you might think why this guy is converting a binary data to string? If I used []byte, when I would have used bytes.Equal that this function does in fact convert byte slices to string
 					}
+					// log
+					log.WithFields(log.Fields{
+						"KeyAgreement": KeyAgreement,
+						"TransferType": TransferType,
+						"Encryption":   Encryption,
+						"Buffer":       BufferSize,
+					}).Debug()
 					// start listening according to type of transfer type
 					switch TransferType {
 					case "tcp": // use raw tcp

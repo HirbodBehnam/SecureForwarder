@@ -68,7 +68,7 @@ func TCPHandleForwardServer(conn net.Conn) { // forward all connections
 		// otherwise just continue to handshake
 	}
 
-	// perform the handshake
+	// perform rsa handshake
 	if KeyAgreement == "x25519" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" {
 		_, err = conn.Write(RSAPublicPem) // on client we use big buffer (8*1024) because in future I might add something to change the key size
 		if err != nil {
@@ -101,6 +101,7 @@ func TCPHandleForwardServer(conn net.Conn) { // forward all connections
 	switch KeyAgreement {
 	case "sha-256":
 		key = []byte(Password) // that's it :D
+		goto startTransfer
 	case "x25519": // this type is little different
 		// at first generate a x25519 key pair (client also creates one meanwhile)
 		xKey, err := x25519.NewX25519()
@@ -127,6 +128,7 @@ func TCPHandleForwardServer(conn net.Conn) { // forward all connections
 			log.Error("Cannot do the final key agreement: ", err.Error())
 			return
 		}
+		goto startTransfer
 	case "pbkdf2":
 		// generate salt
 		_, _ = rand.Read(salt)
@@ -168,8 +170,9 @@ func TCPHandleForwardServer(conn net.Conn) { // forward all connections
 	}
 
 	// save the data in map
-	{
+	if KeyAgreement == "pbkdf2" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" {
 		// we reuse salt; generate a random id for user
+		salt = make([]byte, 8)
 		_, _ = rand.Read(salt)
 		salt[0] |= 128
 		_, err = conn.Write(salt) // send the id to client
