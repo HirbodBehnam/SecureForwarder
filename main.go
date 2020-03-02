@@ -317,13 +317,14 @@ func main() {
 					// at first check the certificate verification and create URL
 					serverUrl := url.URL{Scheme: TransferType, Host: To, Path: "/"}
 					if TrustCert {
+						log.Debug("Trusting all certs")
 						dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 					}
 					// before to start listening for connection do the handshake if needed
 					if KeyAgreement == "pbkdf2" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // these algorithms need handshake
 						err = func() error {
 							id := make([]byte, 8)
-							srv, _, err := websocket.DefaultDialer.Dial(serverUrl.String(), nil)
+							srv, _, err := dialer.Dial(serverUrl.String(), nil)
 							if err != nil {
 								log.Error("Cannot dial when client wanted to handshake")
 								return err
