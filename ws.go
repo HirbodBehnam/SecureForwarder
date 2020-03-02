@@ -29,8 +29,9 @@ func WebsocketBase(w http.ResponseWriter, r *http.Request) {
 		log.Error("Cannot upgrade: ", err.Error())
 		return
 	}
+	defer log.WithField("client", conn.RemoteAddr()).Trace("Closing connection")
 	defer conn.Close()
-	log.Trace("New connection from ", r.RemoteAddr)
+	log.WithField("from", r.RemoteAddr).Trace("New connection")
 
 	// do the handshake just like tcp
 	salt := make([]byte, 8)
@@ -40,7 +41,7 @@ func WebsocketBase(w http.ResponseWriter, r *http.Request) {
 	if KeyAgreement == "pbkdf2" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" {
 		_, idStart, err := conn.ReadMessage() // read the id
 		if err != nil {
-			log.Error("Cannot read id from client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot read id from client")
 			return
 		}
 		// check if this a handshake packet or client is using an id; Handshake packet starts with 0 in binary. However id always starts with 1
@@ -57,24 +58,27 @@ func WebsocketBase(w http.ResponseWriter, r *http.Request) {
 	if KeyAgreement == "x25519" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" {
 		err = conn.WriteMessage(websocket.TextMessage, RSAPublicPem) // send the public key to client
 		if err != nil {
-			log.Error("Cannot write to client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot write public key to client")
 			return
 		}
 		{ // read the client's response that must be RSA encrypted password
 			_, userPass, err := conn.ReadMessage()
 			if err != nil {
-				log.Error("Cannot write to client: ", err.Error())
+				log.WithField("error", err.Error()).Error("Cannot read encrypted password from client")
 				return
 			}
 			// try to decrypt the password
 			decrypted, err := crypt.RSADecryptWithPrivateKey(userPass, RSAPrivateKey)
 			if err != nil {
-				log.Error("Invalid handshake from ", conn.RemoteAddr())
+				log.WithFields(log.Fields{
+					"from":  conn.RemoteAddr(),
+					"error": err.Error(),
+				}).Error("Invalid handshake")
 				return
 			}
 			// check if the password was correct
 			if string(decrypted) != Password {
-				log.Error("Invalid password from ", conn.RemoteAddr())
+				log.WithField("from", conn.RemoteAddr()).Error("Invalid password")
 				return
 			}
 		}
@@ -90,25 +94,25 @@ func WebsocketBase(w http.ResponseWriter, r *http.Request) {
 		// at first generate a x25519 key pair (client also creates one meanwhile)
 		xKey, err := x25519.NewX25519()
 		if err != nil {
-			log.Error("Cannot generate X25519 key pair: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot generate X25519 key pair")
 			return
 		}
 		// send the public key to client
 		err = conn.WriteMessage(websocket.BinaryMessage, xKey.PublicKey)
 		if err != nil {
-			log.Error("Cannot send public key to client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot send public key to client")
 			return
 		}
 		// get the public key of the user
 		_, otherPub, err := conn.ReadMessage()
 		if err != nil {
-			log.Error("Cannot get client's X25519 public key: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot get client's X25519 public key")
 			return
 		}
 		// generate secret
 		key, err = xKey.GenerateSharedSecret(otherPub)
 		if err != nil {
-			log.Error("Cannot do the final key agreement: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot do the final key agreement")
 			return
 		}
 		goto startTransfer
@@ -120,7 +124,7 @@ func WebsocketBase(w http.ResponseWriter, r *http.Request) {
 		// send salt to user
 		err = conn.WriteMessage(websocket.BinaryMessage, salt)
 		if err != nil {
-			log.Error("Cannot send salt to client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot send salt to client")
 			return
 		}
 	case "scrypt":
@@ -129,13 +133,13 @@ func WebsocketBase(w http.ResponseWriter, r *http.Request) {
 		// send salt to user
 		err = conn.WriteMessage(websocket.BinaryMessage, salt)
 		if err != nil {
-			log.Error("Cannot send salt to client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot send salt to client")
 			return
 		}
 		// generate the key
 		key, err = scrypt.Key([]byte(Password), salt, 1<<14, 8, 1, 32)
 		if err != nil {
-			log.Error("Cannot creat key from scrypt: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot creat key from scrypt")
 			return
 		}
 	case "argon2":
@@ -145,7 +149,7 @@ func WebsocketBase(w http.ResponseWriter, r *http.Request) {
 		// send salt to user
 		err = conn.WriteMessage(websocket.BinaryMessage, salt)
 		if err != nil {
-			log.Error("Cannot send salt to client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot send salt to client")
 			return
 		}
 		// generate the key
@@ -160,7 +164,7 @@ func WebsocketBase(w http.ResponseWriter, r *http.Request) {
 		salt[0] |= 128
 		err = conn.WriteMessage(websocket.BinaryMessage, salt) // send the id to client
 		if err != nil {
-			log.Error("Cannot send id to client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot send id to client")
 			return
 		}
 		IdAndKeys.Set(string(salt), key) // save it
@@ -181,7 +185,11 @@ startTransfer:
 	}
 	defer proxy.Close()
 
-	log.Trace("Key is ", base64.StdEncoding.EncodeToString(key), " for ", conn.RemoteAddr())
+	log.WithFields(log.Fields{
+		"key":    base64.StdEncoding.EncodeToString(key),
+		"client": conn.RemoteAddr(),
+	}).Trace("Starting to proxy")
+
 	// start transfer
 	var err2 error
 	mu := sync.Mutex{} // this is used to sync the errors
@@ -290,7 +298,11 @@ startTransfer:
 			}
 			plainText, err = c.Open(nil, message[:12], message[12:], nil)
 			if err != nil {
-				log.Println(err)
+				log.WithFields(log.Fields{
+					"src":   proxy.RemoteAddr(),
+					"dest":  conn.RemoteAddr(),
+					"error": err2.Error(),
+				}).Error("Error on decrypting data")
 				break
 			}
 			_, err = proxy.Write(plainText)
@@ -300,11 +312,11 @@ startTransfer:
 		}
 	}
 	mu.Lock() // wait until mutex is free; no need to unlock. It will be gone with GC
-	if err != nil {
-		log.Debug("Error on copy (server -> client): ", err.Error())
+	if err2 != nil {
+		log.WithField("error", err2.Error()).Debug("Error on copy (server -> client)")
 	}
 	if err != nil {
-		log.Debug("Error on copy (client -> server): ", err.Error())
+		log.WithField("error", err.Error()).Debug("Error on copy (client -> server)")
 	}
 }
 
@@ -319,11 +331,14 @@ func WebsocketListenClient(serverUrl url.URL) error {
 	for {
 		conn, err := listener.Accept() // accept incoming connections
 		if err != nil {
-			log.Error("Could not accept a connection from ", conn.RemoteAddr(), "; ", err.Error())
+			log.WithFields(log.Fields{
+				"from":  conn.RemoteAddr(),
+				"error": err.Error(),
+			}).Error("Could not accept an incoming connection")
 			continue
 		}
 
-		log.Debug("Accepting a connection from ", conn.RemoteAddr())
+		log.WithField("from", conn.RemoteAddr()).Debug("Accepting a connection")
 		go WebsocketHandleClientConnection(conn, serverUrl)
 	}
 }
@@ -344,7 +359,7 @@ func WebsocketHandleClientConnection(conn net.Conn, serverUrl url.URL) {
 		log.Trace(base64.StdEncoding.EncodeToString([]byte(item.Key)), " -> ", base64.StdEncoding.EncodeToString(item.Val.([]byte)))
 		err = srv.WriteMessage(websocket.BinaryMessage, []byte(item.Key))
 		if err != nil {
-			log.Error("cannot send the id to server", err.Error())
+			log.WithField("error", err.Error()).Error("cannot send the id to server")
 			return
 		}
 		key = item.Val.([]byte)
@@ -354,24 +369,24 @@ func WebsocketHandleClientConnection(conn net.Conn, serverUrl url.URL) {
 	if KeyAgreement == "x25519" { // in theses methods we should get the RSA key and encrypt out password with it
 		_, rsaPem, err := srv.ReadMessage() // read the RSA public key
 		if err != nil {
-			log.Error("Cannot get the public key of server: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot get the public key of server")
 			return
 		}
 		pubKey, err := crypt.RSABytesToPublicKey(rsaPem) // pem to public key
 		if err != nil {
-			log.Error("Cannot convert public key of server: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot parse public key of server")
 			return
 		}
 
 		// encrypt the password
 		encryptedPass, err := crypt.RSAEncryptWithPublicKey([]byte(Password), pubKey)
 		if err != nil {
-			log.Error("Cannot convert public key of server: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot convert public key of server")
 			return
 		}
 		err = srv.WriteMessage(websocket.BinaryMessage, encryptedPass)
 		if err != nil {
-			log.Error("Cannot send encrypted password to server: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot send encrypted password to server")
 			return
 		}
 	}
@@ -386,25 +401,25 @@ func WebsocketHandleClientConnection(conn net.Conn, serverUrl url.URL) {
 		// at first generate a x25519 key pair (server also creates one meanwhile)
 		xKey, err := x25519.NewX25519()
 		if err != nil {
-			log.Error("Cannot generate X25519 key pair: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot generate X25519 key pair")
 			return
 		}
 		// read the server's public key
 		_, salt, err = srv.ReadMessage()
 		if err != nil {
-			log.Error("Cannot get client's X25519 public key: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot get server's X25519 public key")
 			return
 		}
 		// send the public key to server
 		err = srv.WriteMessage(websocket.BinaryMessage, xKey.PublicKey)
 		if err != nil {
-			log.Error("Cannot send public key to client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot send public key to server")
 			return
 		}
 		// generate secret
 		key, err = xKey.GenerateSharedSecret(salt)
 		if err != nil {
-			log.Error("Cannot do the final key agreement: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot do the final key agreement")
 			return
 		}
 	}
@@ -464,7 +479,11 @@ func WebsocketHandleClientConnection(conn net.Conn, serverUrl url.URL) {
 				// decrypt the message
 				plainText, err2 = c.Open(nil, message[:12], message[12:], nil)
 				if err2 != nil {
-					log.Error("Error on decrypting data: ", err2.Error())
+					log.WithFields(log.Fields{
+						"src":   srv.RemoteAddr(),
+						"dest":  conn.RemoteAddr(),
+						"error": err2.Error(),
+					}).Error("Error on decrypting data")
 					srv.Close()
 					conn.Close()
 					return
@@ -541,9 +560,9 @@ func WebsocketHandleClientConnection(conn net.Conn, serverUrl url.URL) {
 	}
 	mu.Lock() // wait until mutex is free; no need to unlock. It will be gone with GC
 	if err2 != nil {
-		log.Debug("Error on copy (server -> client): ", err2.Error())
+		log.WithField("error", err2.Error()).Debug("Error on copy (server -> client)")
 	}
 	if err != nil {
-		log.Debug("Error on copy (client -> server): ", err.Error())
+		log.WithField("error", err.Error()).Debug("Error on copy (client -> server)")
 	}
 }

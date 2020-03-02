@@ -30,11 +30,14 @@ func TCPStartListen() error {
 	for {
 		conn, err := listener.Accept() // accept incoming connections
 		if err != nil {
-			log.Error("Could not accept a connection from ", conn.RemoteAddr(), "; ", err.Error())
+			log.WithFields(log.Fields{
+				"from":  conn.RemoteAddr(),
+				"error": err.Error(),
+			}).Error("Could not accept an incoming connection")
 			continue
 		}
 
-		log.Debug("Accepting a connection from ", conn.RemoteAddr())
+		log.WithField("from", conn.RemoteAddr()).Debug("Accepting a connection")
 		if ServerApp {
 			go TCPHandleForwardServer(conn)
 		} else {
@@ -45,6 +48,7 @@ func TCPStartListen() error {
 
 // do the key agreement and handshake and at last, start coping
 func TCPHandleForwardServer(conn net.Conn) { // forward all connections
+	defer log.WithField("client", conn.RemoteAddr()).Trace("Closing connection")
 	defer conn.Close()
 	var err error
 	salt := make([]byte, 8)
@@ -54,7 +58,7 @@ func TCPHandleForwardServer(conn net.Conn) { // forward all connections
 	if KeyAgreement == "pbkdf2" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // check the id map
 		_, err = conn.Read(salt) // we temporary use salt
 		if err != nil {
-			log.Error("Cannot read id from client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot read id from client")
 			return
 		}
 		// check if this a handshake packet or client is using an id; Handshake packet starts with 0 in binary. However id always starts with 1
@@ -71,25 +75,28 @@ func TCPHandleForwardServer(conn net.Conn) { // forward all connections
 	if KeyAgreement == "x25519" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" {
 		_, err = conn.Write(RSAPublicPem) // on client we use big buffer (8*1024) because in future I might add something to change the key size
 		if err != nil {
-			log.Error("Cannot write to client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot write public key to client")
 			return
 		}
 		{ // read the client's response that must be RSA encrypted password
 			tBuf := make([]byte, 8*1024)
 			readC, err := conn.Read(tBuf)
 			if err != nil {
-				log.Error("Cannot write to client: ", err.Error())
+				log.WithField("error", err.Error()).Error("Cannot read clients response on RSA handshake")
 				return
 			}
 			// try to decrypt the password
 			decrypted, err := crypt.RSADecryptWithPrivateKey(tBuf[:readC], RSAPrivateKey)
 			if err != nil {
-				log.Error("Invalid handshake from ", conn.RemoteAddr())
+				log.WithFields(log.Fields{
+					"from":  conn.RemoteAddr(),
+					"error": err.Error(),
+				}).Error("Invalid handshake")
 				return
 			}
 			// check if the password was correct
 			if string(decrypted) != Password {
-				log.Error("Invalid password from ", conn.RemoteAddr())
+				log.WithField("from", conn.RemoteAddr()).Error("Invalid password")
 				return
 			}
 		}
@@ -105,26 +112,26 @@ func TCPHandleForwardServer(conn net.Conn) { // forward all connections
 		// at first generate a x25519 key pair (client also creates one meanwhile)
 		xKey, err := x25519.NewX25519()
 		if err != nil {
-			log.Error("Cannot generate X25519 key pair: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot generate X25519 key pair")
 			return
 		}
 		// send the public key to client
 		_, err = conn.Write(xKey.PublicKey)
 		if err != nil {
-			log.Error("Cannot send public key to client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot send public key to client")
 			return
 		}
 		// get the public key of the user
 		otherPub := make([]byte, 32) // key is always 32 byte
 		_, err = conn.Read(otherPub)
 		if err != nil {
-			log.Error("Cannot get client's X25519 public key: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot get client's X25519 public key")
 			return
 		}
 		// generate secret
 		key, err = xKey.GenerateSharedSecret(otherPub)
 		if err != nil {
-			log.Error("Cannot do the final key agreement: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot do the final key agreement")
 			return
 		}
 		goto startTransfer
@@ -136,7 +143,7 @@ func TCPHandleForwardServer(conn net.Conn) { // forward all connections
 		// send salt to user
 		_, err = conn.Write(salt)
 		if err != nil {
-			log.Error("Cannot send salt to client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot send salt to client")
 			return
 		}
 	case "scrypt":
@@ -145,13 +152,13 @@ func TCPHandleForwardServer(conn net.Conn) { // forward all connections
 		// send salt to user
 		_, err = conn.Write(salt)
 		if err != nil {
-			log.Error("Cannot send salt to client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot send salt to client")
 			return
 		}
 		// generate the key
 		key, err = scrypt.Key([]byte(Password), salt, 1<<14, 8, 1, 32)
 		if err != nil {
-			log.Error("Cannot creat key from scrypt: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot create key from scrypt")
 			return
 		}
 	case "argon2":
@@ -161,7 +168,7 @@ func TCPHandleForwardServer(conn net.Conn) { // forward all connections
 		// send salt to user
 		_, err = conn.Write(salt)
 		if err != nil {
-			log.Error("Cannot send salt to client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot send salt to client")
 			return
 		}
 		// generate the key
@@ -176,7 +183,7 @@ func TCPHandleForwardServer(conn net.Conn) { // forward all connections
 		salt[0] |= 128
 		_, err = conn.Write(salt) // send the id to client
 		if err != nil {
-			log.Error("Cannot send id to client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot send id to client")
 			return
 		}
 		IdAndKeys.Set(string(salt), key) // save it
@@ -192,12 +199,18 @@ startTransfer:
 	// dial the destination
 	proxy, err := net.Dial("tcp", To)
 	if err != nil {
-		log.Error("Cannot dial ", To, ": ", err.Error())
+		log.WithFields(log.Fields{
+			"error": err.Error(),
+			"to":    To,
+		}).Error("Cannot dial proxy")
 		return
 	}
 	defer proxy.Close()
 
-	log.Trace("Key is ", base64.StdEncoding.EncodeToString(key), " for ", conn.RemoteAddr())
+	log.WithFields(log.Fields{
+		"key":    base64.StdEncoding.EncodeToString(key),
+		"client": conn.RemoteAddr(),
+	}).Trace("Starting to proxy")
 
 	// start transfer
 	var err2 error
@@ -210,10 +223,10 @@ startTransfer:
 	err = TCPCopyConnectionEncrypt(proxy, conn, key) // server -> client ; must be encrypted. Use default buffer size
 	mu.Lock()                                        // wait until mutex is free; no need to unlock. It will be gone with GC
 	if err != nil {
-		log.Debug("Error on copy (server -> client): ", err.Error())
+		log.WithField("error", err.Error()).Debug("Error on copy (server -> client)")
 	}
 	if err2 != nil {
-		log.Debug("Error on copy (client -> server): ", err2.Error())
+		log.WithField("error", err2.Error()).Debug("Error on copy (client -> server)")
 	}
 }
 
@@ -225,6 +238,7 @@ func TCPHandleForwardClient(conn net.Conn) {
 		log.Error("Cannot dial ", To, ": ", err.Error())
 		return
 	}
+	defer log.WithField("proxy", conn.RemoteAddr()).Trace("Closing connection")
 	defer srv.Close()
 
 	var key []byte // is always 256 bit
@@ -234,7 +248,7 @@ func TCPHandleForwardClient(conn net.Conn) {
 		log.Trace(base64.StdEncoding.EncodeToString([]byte(item.Key)), " -> ", base64.StdEncoding.EncodeToString(item.Val.([]byte)))
 		_, err = srv.Write([]byte(item.Key))
 		if err != nil {
-			log.Error("cannot send the id to server", err.Error())
+			log.WithField("error", err.Error()).Error("cannot send the id to server")
 			return
 		}
 		key = item.Val.([]byte)
@@ -245,24 +259,24 @@ func TCPHandleForwardClient(conn net.Conn) {
 		rsaPem := make([]byte, 1024*4)     // 16384 bit RSA is 2880 bytes. Just make sure that there is enough buffer to read the key
 		readCount, err := srv.Read(rsaPem) // read the RSA public key
 		if err != nil {
-			log.Error("Cannot get the public key of server: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot get the public key of server")
 			return
 		}
 		pubKey, err := crypt.RSABytesToPublicKey(rsaPem[:readCount]) // pem to public key
 		if err != nil {
-			log.Error("Cannot convert public key of server: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot convert public key of server")
 			return
 		}
 
 		// encrypt the password
 		encryptedPass, err := crypt.RSAEncryptWithPublicKey([]byte(Password), pubKey)
 		if err != nil {
-			log.Error("Cannot convert public key of server: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot convert public key of server")
 			return
 		}
 		_, err = srv.Write(encryptedPass)
 		if err != nil {
-			log.Error("Cannot send encrypted password to server: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot send encrypted password to server")
 			return
 		}
 	}
@@ -277,30 +291,33 @@ func TCPHandleForwardClient(conn net.Conn) {
 		// at first generate a x25519 key pair (server also creates one meanwhile)
 		xKey, err := x25519.NewX25519()
 		if err != nil {
-			log.Error("Cannot generate X25519 key pair: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot generate X25519 key pair")
 			return
 		}
 		// read the servers public key
 		_, err = srv.Read(salt)
 		if err != nil {
-			log.Error("Cannot get client's X25519 public key: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot get server's X25519 public key")
 			return
 		}
 		// send the public key to server
 		_, err = srv.Write(xKey.PublicKey)
 		if err != nil {
-			log.Error("Cannot send public key to client: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot send public key to server")
 			return
 		}
 		// generate secret
 		key, err = xKey.GenerateSharedSecret(salt)
 		if err != nil {
-			log.Error("Cannot do the final key agreement: ", err.Error())
+			log.WithField("error", err.Error()).Error("Cannot do the final key agreement")
 			return
 		}
 	}
 
-	log.Trace("Key is ", base64.StdEncoding.EncodeToString(key), " for ", srv.LocalAddr())
+	log.WithFields(log.Fields{
+		"key":    base64.StdEncoding.EncodeToString(key),
+		"client": conn.RemoteAddr(),
+	}).Trace("Starting to proxy")
 
 	// now start coping
 	var err2 error
@@ -313,10 +330,10 @@ func TCPHandleForwardClient(conn net.Conn) {
 	err = TCPCopyConnectionEncrypt(conn, srv, key) // client -> server ; must be encrypted. Use default buffer size
 	mu.Lock()                                      // wait until mutex is free; no need to unlock. It will be gone with GC
 	if err2 != nil {
-		log.Debug("Error on copy (server -> client): ", err2.Error())
+		log.WithField("error", err2.Error()).Debug("Error on copy (server -> client)")
 	}
 	if err != nil {
-		log.Debug("Error on copy (client -> server): ", err.Error())
+		log.WithField("error", err.Error()).Debug("Error on copy (client -> server)")
 	}
 }
 
@@ -461,7 +478,11 @@ func TCPCopyConnectionDecrypt(src, dst net.Conn, key []byte) (err error) {
 			if nr > 0 {
 				plainText, err = c.Open(nil, buf[:12], buf[12:nr], nil)
 				if err != nil {
-					log.Error("Error on decrypting data: ", err.Error())
+					log.WithFields(log.Fields{
+						"src":   src.RemoteAddr(),
+						"dest":  dst.RemoteAddr(),
+						"error": err.Error(),
+					}).Error("Error on decrypting data")
 					src.Close()
 					dst.Close()
 					return err
