@@ -196,6 +196,7 @@ startTransfer:
 					for i = 0; i < nr; i++ { // encrypt
 						buf[i] ^= key[i%32]
 					}
+					err2 = conn.WriteMessage(websocket.BinaryMessage, buf[:nr]) // send to client
 				}
 				if err2 != nil {
 					if err2 == io.EOF {
@@ -249,13 +250,14 @@ startTransfer:
 	// client -> server ; must be decrypted
 	if Encryption == "xor" {
 		var message []byte
-		var i int
+		var i, nr int
 		for {
 			_, message, err = conn.ReadMessage() // read the message
 			if err != nil {
 				break
 			}
-			for i = 0; i < len(message); i++ { // decrypt
+			nr = len(message)
+			for i = 0; i < nr; i++ { // decrypt
 				message[i] ^= key[i%32]
 			}
 			_, err = proxy.Write(message) // send to proxy
