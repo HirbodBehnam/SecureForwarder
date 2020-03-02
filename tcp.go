@@ -33,7 +33,6 @@ func TCPStartListen() error {
 			log.Error("Could not accept a connection from ", conn.RemoteAddr(), "; ", err.Error())
 			continue
 		}
-		conn.RemoteAddr().Network()
 
 		log.Debug("Accepting a connection from ", conn.RemoteAddr())
 		if ServerApp {
@@ -213,8 +212,8 @@ startTransfer:
 	if err != nil {
 		log.Debug("Error on copy (server -> client): ", err.Error())
 	}
-	if err != nil {
-		log.Debug("Error on copy (client -> server): ", err.Error())
+	if err2 != nil {
+		log.Debug("Error on copy (client -> server): ", err2.Error())
 	}
 }
 
@@ -380,9 +379,9 @@ func TCPCopyConnectionEncrypt(src, dst net.Conn, key []byte) (err error) {
 			nr, er = src.Read(buf)
 			if nr > 0 {
 				_, _ = rand.Read(nonce)
-				cipherText = c.Seal(nil, nonce, buf[:nr], nil)
-				cipherText = append(nonce, cipherText...) // add nonce
-				_, ew = dst.Write(cipherText)
+				cipherText = c.Seal(nil, nonce, buf[:nr], nil) // encrypt data
+				cipherText = append(nonce, cipherText...)      // add nonce
+				_, ew = dst.Write(cipherText)                  // send to client
 				if ew != nil {
 					err = ew
 					break
@@ -416,7 +415,7 @@ func TCPCopyConnectionDecrypt(src, dst net.Conn, key []byte) (err error) {
 		for {
 			nr, er = src.Read(buf)
 			if nr > 0 {
-				for i = 0; i < nr; i++ { // encrypt
+				for i = 0; i < nr; i++ { // decrypt
 					buf[i] ^= key[i%32]
 				}
 				nw, ew = dst.Write(buf[0:nr])
@@ -437,7 +436,7 @@ func TCPCopyConnectionDecrypt(src, dst net.Conn, key []byte) (err error) {
 			}
 		}
 	} else {
-		// ready encryption stuff
+		// ready decryption stuff
 		var c cipher.AEAD
 		var plainText []byte
 		if Encryption == "aes" {
