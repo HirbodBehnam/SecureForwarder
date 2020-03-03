@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -54,6 +55,80 @@ const VERSION = "1.0.0 / Build 1"
 
 func main() {
 	IdAndKeys = cmap.New()
+
+	if os.Getenv("SS_LOCAL_HOST") != "" { // check if the program is running as shadowsocks plugin
+		var exists bool
+		args := ParseShadowsocksOptions(os.Getenv("SS_PLUGIN_OPTIONS"))
+		_, ServerApp = args["server"] // check if this is server application
+		// check the password
+		if Password, exists = args["password"]; !exists {
+			log.Fatal("Password is not defined")
+		}
+		// parse transfer type
+		if TransferType, exists = args["type"]; !exists {
+			TransferType = "tcp"
+		}
+		// parse encryption type
+		if Encryption, exists = args["encryption"]; !exists {
+			Encryption = "chacha"
+		}
+		// parse key agreement
+		if KeyAgreement, exists = args["agreement"]; !exists {
+			KeyAgreement = "pbkdf2"
+		}
+		// buffer size key agreement
+		if BufferSizeString, exists := args["buffer"]; !exists {
+			BufferSize = 1024 * 32
+		} else {
+			BufferSizeI, err := strconv.Atoi(BufferSizeString)
+			if err != nil {
+				log.WithField("error", err.Error()).Fatal("Cannot parse BufferSize")
+			}
+			BufferSize = BufferSizeI
+		}
+		// parse loglevel
+		if Loglevel, exists = args["loglevel"]; !exists {
+			Loglevel = "info"
+		}
+		// parse IP and etc
+		if ServerApp { // server mode
+			if To, exists = args["host"]; exists {
+				To += ":" + os.Getenv("SS_LOCAL_PORT")
+			} else {
+				To = os.Getenv("SS_LOCAL_HOST") + ":" + os.Getenv("SS_LOCAL_PORT")
+			}
+			InterfaceAddress = os.Getenv("SS_REMOTE_HOST")
+			Port = os.Getenv("SS_REMOTE_PORT")
+			// parse cert path
+			if CertPath, exists = args["cert"]; !exists {
+				CertPath = "cert.pem"
+			}
+			if KeyPath, exists = args["key"]; !exists {
+				KeyPath = "cert.pem"
+			}
+
+			// start the server
+			err := StartServer()
+			if err != nil {
+				log.Fatal(err)
+			}
+		} else { // client mode
+			To = os.Getenv("SS_REMOTE_HOST") + ":" + os.Getenv("SS_REMOTE_PORT")
+			InterfaceAddress = os.Getenv("SS_LOCAL_HOST")
+			Port = os.Getenv("SS_LOCAL_PORT")
+			// check if trust the certs
+			_, TrustCert = args["trust"]
+
+			// start the client
+			err := StartClient()
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		return
+	}
+
 	app := &cli.App{
 		Name:        "Secure Forwarder",
 		Usage:       "Forward your encrypted packets",
@@ -146,44 +221,7 @@ func main() {
 				},
 				Usage: "run as server application",
 				Action: func(c *cli.Context) error {
-					ServerApp = true
-					err := FixAndCheckArguments()
-					if err != nil {
-						return err
-					}
-					// at first do some pre calculations
-					if KeyAgreement == "sha-256" {
-						hashed := sha256.Sum256([]byte(Password))
-						Password = string(hashed[:]) // you might think why this guy is converting a binary data to string? If I used []byte, when I would have used bytes.Equal that this function does in fact convert byte slices to string
-						log.Trace("Key is ", base64.StdEncoding.EncodeToString(hashed[:]))
-					}
-					// log
-					log.WithFields(log.Fields{
-						"KeyAgreement": KeyAgreement,
-						"TransferType": TransferType,
-						"Encryption":   Encryption,
-						"Buffer":       BufferSize,
-					}).Debug()
-					// start listening according to type of transfer type
-					switch TransferType {
-					case "tcp": // use raw tcp
-						return TCPStartListen()
-					case "ws": // use unencrypted websocket
-						upgrader.ReadBufferSize = BufferSize + 28 // no need to add 28 but it's fine
-						upgrader.WriteBufferSize = BufferSize + 28
-						// create ws server
-						http.HandleFunc("/", WebsocketBase)
-						log.Info("starting WS listener on ", InterfaceAddress+":"+Port)
-						return http.ListenAndServe(InterfaceAddress+":"+Port, nil)
-					case "wss": // use secure websocket
-						upgrader.ReadBufferSize = BufferSize + 28 // no need to add 28 but it's fine
-						upgrader.WriteBufferSize = BufferSize + 28
-						// create ws server
-						http.HandleFunc("/", WebsocketBase)
-						log.Info("starting WSS listener on ", InterfaceAddress+":"+Port)
-						return http.ListenAndServeTLS(InterfaceAddress+":"+Port, CertPath, KeyPath, nil)
-					}
-					return nil
+					return StartServer()
 				},
 			},
 			{
@@ -200,218 +238,7 @@ func main() {
 					},
 				},
 				Action: func(c *cli.Context) error {
-					ServerApp = false
-					err := FixAndCheckArguments()
-					if err != nil {
-						return err
-					}
-					// at first do some pre calculations
-					if KeyAgreement == "sha-256" {
-						hashed := sha256.Sum256([]byte(Password))
-						Password = string(hashed[:]) // you might think why this guy is converting a binary data to string? If I used []byte, when I would have used bytes.Equal that this function does in fact convert byte slices to string
-						log.Trace("Key is ", base64.StdEncoding.EncodeToString(hashed[:]))
-					}
-					// log
-					log.WithFields(log.Fields{
-						"KeyAgreement": KeyAgreement,
-						"TransferType": TransferType,
-						"Encryption":   Encryption,
-						"Buffer":       BufferSize,
-					}).Debug()
-					// start listening according to type of transfer type
-					if TransferType == "tcp" { // use raw tcp
-						// before to start listening for connection do the handshake if needed
-						if KeyAgreement == "pbkdf2" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // these algorithms need handshake
-							err = func() error {
-								id := make([]byte, 8)
-								srv, err := net.Dial("tcp", To) // connect to server
-								if err != nil {
-									log.Error("Cannot dial when client wanted to handshake")
-									return err
-								}
-								defer srv.Close()
-								_, err = srv.Write(id) // just inform the server that I want to do handshake; First bit is 0
-								if err != nil {
-									log.Error("Cannot send data to server in handshake")
-									return err
-								}
-
-								// perform the rsa handshake if needed
-								if KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // in theses methods we should get the RSA key and encrypt out password with it
-									rsaPem := make([]byte, 1024*4)     // 16384 bit RSA is 2880 bytes. Just make sure that there is enough buffer to read the key
-									readCount, err := srv.Read(rsaPem) // read the RSA public key
-									if err != nil {
-										log.Error("Cannot get the public key of server: ", err.Error())
-										return err
-									}
-									pubKey, err := crypt.RSABytesToPublicKey(rsaPem[:readCount]) // pem to public key
-									if err != nil {
-										log.Error("Cannot convert public key of server: ", err.Error())
-										return err
-									}
-
-									// encrypt the password
-									encryptedPass, err := crypt.RSAEncryptWithPublicKey([]byte(Password), pubKey)
-									if err != nil {
-										log.Error("Cannot convert public key of server: ", err.Error())
-										return err
-									}
-									_, err = srv.Write(encryptedPass)
-									if err != nil {
-										log.Error("Cannot send encrypted password to server: ", err.Error())
-										return err
-									}
-								}
-
-								// get the key
-								salt := make([]byte, 8)
-								var key []byte // is always 256 bit
-								switch KeyAgreement {
-								case "pbkdf2":
-									// server sends a 8 byte salt to us
-									_, err = srv.Read(salt)
-									if err != nil {
-										log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
-										return err
-									}
-									// generate shared key
-									key = pbkdf2.Key([]byte(Password), salt, 1024*16, 32, sha1.New)
-								case "scrypt":
-									// server sends a 8 byte salt to us
-									_, err = srv.Read(salt)
-									if err != nil {
-										log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
-										return err
-									}
-									// generate shared key
-									key, err = scrypt.Key([]byte(Password), salt, 1<<14, 8, 1, 32)
-								case "argon2":
-									// server sends a 16 byte salt to us
-									salt = make([]byte, 16)
-									_, err = srv.Read(salt)
-									if err != nil {
-										log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
-										return err
-									}
-									// generate shared key
-									key = argon2.IDKey([]byte(Password), salt, 10, 1<<14, 2, 32)
-								}
-
-								log.Trace("Key is ", base64.StdEncoding.EncodeToString(key))
-								_, err = srv.Read(id)
-								if err != nil {
-									log.Error("Cannot get id from server")
-									return err
-								}
-								log.Trace("Id is ", base64.StdEncoding.EncodeToString(id))
-								IdAndKeys.Set(string(id), key)
-								return nil
-							}()
-						}
-						// start listing
-						return TCPStartListen()
-					}
-					// set websocket buffers
-					dialer.WriteBufferSize = BufferSize + 28
-					dialer.ReadBufferSize = BufferSize + 28
-					// at first check the certificate verification and create URL
-					serverUrl := url.URL{Scheme: TransferType, Host: To, Path: "/"}
-					if TrustCert {
-						log.Debug("Trusting all certs")
-						dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-					}
-					// before to start listening for connection do the handshake if needed
-					if KeyAgreement == "pbkdf2" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // these algorithms need handshake
-						err = func() error {
-							id := make([]byte, 8)
-							srv, _, err := dialer.Dial(serverUrl.String(), nil)
-							if err != nil {
-								log.Error("Cannot dial when client wanted to handshake")
-								return err
-							}
-							defer srv.Close()
-							err = srv.WriteMessage(websocket.BinaryMessage, id) // just inform the server that I want to do handshake; First bit is 0
-							if err != nil {
-								log.Error("Cannot send data to server in handshake")
-								return err
-							}
-
-							// perform the rsa handshake if needed
-							if KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // in theses methods we should get the RSA key and encrypt out password with it
-								_, rsaPem, err := srv.ReadMessage() // read the RSA public key
-								if err != nil {
-									log.Error("Cannot get the public key of server: ", err.Error())
-									return err
-								}
-								pubKey, err := crypt.RSABytesToPublicKey(rsaPem) // pem to public key
-								if err != nil {
-									log.Error("Cannot convert public key of server: ", err.Error())
-									return err
-								}
-
-								// encrypt the password
-								encryptedPass, err := crypt.RSAEncryptWithPublicKey([]byte(Password), pubKey)
-								if err != nil {
-									log.Error("Cannot convert public key of server: ", err.Error())
-									return err
-								}
-								err = srv.WriteMessage(websocket.BinaryMessage, encryptedPass)
-								if err != nil {
-									log.Error("Cannot send encrypted password to server: ", err.Error())
-									return err
-								}
-							}
-
-							// get the key
-							salt := make([]byte, 8)
-							var key []byte // is always 256 bit
-							switch KeyAgreement {
-							case "pbkdf2":
-								// server sends a 8 byte salt to us
-								_, salt, err = srv.ReadMessage()
-								if err != nil {
-									log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
-									return err
-								}
-								// generate shared key
-								key = pbkdf2.Key([]byte(Password), salt, 1024*16, 32, sha1.New)
-							case "scrypt":
-								// server sends a 8 byte salt to us
-								_, salt, err = srv.ReadMessage()
-								if err != nil {
-									log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
-									return err
-								}
-								// generate shared key
-								key, err = scrypt.Key([]byte(Password), salt, 1<<14, 8, 1, 32)
-							case "argon2":
-								// server sends a 16 byte salt to us
-								_, salt, err = srv.ReadMessage()
-								if err != nil {
-									log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
-									return err
-								}
-								// generate shared key
-								key = argon2.IDKey([]byte(Password), salt, 10, 1<<14, 2, 32)
-							}
-
-							log.Trace("Key is ", base64.StdEncoding.EncodeToString(key))
-							_, id, err = srv.ReadMessage()
-							if err != nil {
-								log.Error("Cannot get id from server")
-								return err
-							}
-							log.Trace("Id is ", base64.StdEncoding.EncodeToString(id))
-							IdAndKeys.Set(string(id), key)
-							return nil
-						}()
-						if err != nil {
-							return err
-						}
-					}
-
-					// now start listing for local connections and forward them
-					return WebsocketListenClient(serverUrl)
+					return StartClient()
 				},
 			},
 		},
@@ -421,6 +248,252 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+// start the server instance
+func StartServer() error {
+	ServerApp = true
+	err := FixAndCheckArguments()
+	if err != nil {
+		return err
+	}
+	// log
+	log.WithFields(log.Fields{
+		"KeyAgreement": KeyAgreement,
+		"TransferType": TransferType,
+		"Encryption":   Encryption,
+		"Buffer":       BufferSize,
+	}).Debug()
+	// start listening according to type of transfer type
+	switch TransferType {
+	case "tcp": // use raw tcp
+		return TCPStartListen()
+	case "ws": // use unencrypted websocket
+		upgrader.ReadBufferSize = BufferSize + 28 // no need to add 28 but it's fine
+		upgrader.WriteBufferSize = BufferSize + 28
+		// create ws server
+		http.HandleFunc("/", WebsocketBase)
+		log.Info("starting WS listener on ", InterfaceAddress+":"+Port)
+		return http.ListenAndServe(InterfaceAddress+":"+Port, nil)
+	case "wss": // use secure websocket
+		upgrader.ReadBufferSize = BufferSize + 28 // no need to add 28 but it's fine
+		upgrader.WriteBufferSize = BufferSize + 28
+		// create ws server
+		http.HandleFunc("/", WebsocketBase)
+		log.Info("starting WSS listener on ", InterfaceAddress+":"+Port)
+		return http.ListenAndServeTLS(InterfaceAddress+":"+Port, CertPath, KeyPath, nil)
+	}
+	return nil
+}
+
+// start the client instance
+func StartClient() error {
+	ServerApp = false
+	err := FixAndCheckArguments()
+	if err != nil {
+		return err
+	}
+	// log
+	log.WithFields(log.Fields{
+		"KeyAgreement": KeyAgreement,
+		"TransferType": TransferType,
+		"Encryption":   Encryption,
+		"Buffer":       BufferSize,
+	}).Debug()
+	// start listening according to type of transfer type
+	if TransferType == "tcp" { // use raw tcp
+		// before to start listening for connection do the handshake if needed
+		if KeyAgreement == "pbkdf2" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // these algorithms need handshake
+			err = func() error {
+				id := make([]byte, 8)
+				srv, err := net.Dial("tcp", To) // connect to server
+				if err != nil {
+					log.Error("Cannot dial when client wanted to handshake")
+					return err
+				}
+				defer srv.Close()
+				_, err = srv.Write(id) // just inform the server that I want to do handshake; First bit is 0
+				if err != nil {
+					log.Error("Cannot send data to server in handshake")
+					return err
+				}
+
+				// perform the rsa handshake if needed
+				if KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // in theses methods we should get the RSA key and encrypt out password with it
+					rsaPem := make([]byte, 1024*4)     // 16384 bit RSA is 2880 bytes. Just make sure that there is enough buffer to read the key
+					readCount, err := srv.Read(rsaPem) // read the RSA public key
+					if err != nil {
+						log.Error("Cannot get the public key of server: ", err.Error())
+						return err
+					}
+					pubKey, err := crypt.RSABytesToPublicKey(rsaPem[:readCount]) // pem to public key
+					if err != nil {
+						log.Error("Cannot convert public key of server: ", err.Error())
+						return err
+					}
+
+					// encrypt the password
+					encryptedPass, err := crypt.RSAEncryptWithPublicKey([]byte(Password), pubKey)
+					if err != nil {
+						log.Error("Cannot convert public key of server: ", err.Error())
+						return err
+					}
+					_, err = srv.Write(encryptedPass)
+					if err != nil {
+						log.Error("Cannot send encrypted password to server: ", err.Error())
+						return err
+					}
+				}
+
+				// get the key
+				salt := make([]byte, 8)
+				var key []byte // is always 256 bit
+				switch KeyAgreement {
+				case "pbkdf2":
+					// server sends a 8 byte salt to us
+					_, err = srv.Read(salt)
+					if err != nil {
+						log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
+						return err
+					}
+					// generate shared key
+					key = pbkdf2.Key([]byte(Password), salt, 1024*16, 32, sha1.New)
+				case "scrypt":
+					// server sends a 8 byte salt to us
+					_, err = srv.Read(salt)
+					if err != nil {
+						log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
+						return err
+					}
+					// generate shared key
+					key, err = scrypt.Key([]byte(Password), salt, 1<<14, 8, 1, 32)
+				case "argon2":
+					// server sends a 16 byte salt to us
+					salt = make([]byte, 16)
+					_, err = srv.Read(salt)
+					if err != nil {
+						log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
+						return err
+					}
+					// generate shared key
+					key = argon2.IDKey([]byte(Password), salt, 10, 1<<14, 2, 32)
+				}
+
+				log.Trace("Key is ", base64.StdEncoding.EncodeToString(key))
+				_, err = srv.Read(id)
+				if err != nil {
+					log.Error("Cannot get id from server")
+					return err
+				}
+				log.Trace("Id is ", base64.StdEncoding.EncodeToString(id))
+				IdAndKeys.Set(string(id), key)
+				return nil
+			}()
+		}
+		// start listing
+		return TCPStartListen()
+	}
+	// set websocket buffers
+	dialer.WriteBufferSize = BufferSize + 28
+	dialer.ReadBufferSize = BufferSize + 28
+	// at first check the certificate verification and create URL
+	serverUrl := url.URL{Scheme: TransferType, Host: To, Path: "/"}
+	if TrustCert {
+		log.Debug("Trusting all certs")
+		dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	// before to start listening for connection do the handshake if needed
+	if KeyAgreement == "pbkdf2" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // these algorithms need handshake
+		err = func() error {
+			id := make([]byte, 8)
+			srv, _, err := dialer.Dial(serverUrl.String(), nil)
+			if err != nil {
+				log.Error("Cannot dial when client wanted to handshake")
+				return err
+			}
+			defer srv.Close()
+			err = srv.WriteMessage(websocket.BinaryMessage, id) // just inform the server that I want to do handshake; First bit is 0
+			if err != nil {
+				log.Error("Cannot send data to server in handshake")
+				return err
+			}
+
+			// perform the rsa handshake if needed
+			if KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // in theses methods we should get the RSA key and encrypt out password with it
+				_, rsaPem, err := srv.ReadMessage() // read the RSA public key
+				if err != nil {
+					log.Error("Cannot get the public key of server: ", err.Error())
+					return err
+				}
+				pubKey, err := crypt.RSABytesToPublicKey(rsaPem) // pem to public key
+				if err != nil {
+					log.Error("Cannot convert public key of server: ", err.Error())
+					return err
+				}
+
+				// encrypt the password
+				encryptedPass, err := crypt.RSAEncryptWithPublicKey([]byte(Password), pubKey)
+				if err != nil {
+					log.Error("Cannot convert public key of server: ", err.Error())
+					return err
+				}
+				err = srv.WriteMessage(websocket.BinaryMessage, encryptedPass)
+				if err != nil {
+					log.Error("Cannot send encrypted password to server: ", err.Error())
+					return err
+				}
+			}
+
+			// get the key
+			salt := make([]byte, 8)
+			var key []byte // is always 256 bit
+			switch KeyAgreement {
+			case "pbkdf2":
+				// server sends a 8 byte salt to us
+				_, salt, err = srv.ReadMessage()
+				if err != nil {
+					log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
+					return err
+				}
+				// generate shared key
+				key = pbkdf2.Key([]byte(Password), salt, 1024*16, 32, sha1.New)
+			case "scrypt":
+				// server sends a 8 byte salt to us
+				_, salt, err = srv.ReadMessage()
+				if err != nil {
+					log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
+					return err
+				}
+				// generate shared key
+				key, err = scrypt.Key([]byte(Password), salt, 1<<14, 8, 1, 32)
+			case "argon2":
+				// server sends a 16 byte salt to us
+				_, salt, err = srv.ReadMessage()
+				if err != nil {
+					log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
+					return err
+				}
+				// generate shared key
+				key = argon2.IDKey([]byte(Password), salt, 10, 1<<14, 2, 32)
+			}
+
+			log.Trace("Key is ", base64.StdEncoding.EncodeToString(key))
+			_, id, err = srv.ReadMessage()
+			if err != nil {
+				log.Error("Cannot get id from server")
+				return err
+			}
+			log.Trace("Id is ", base64.StdEncoding.EncodeToString(id))
+			IdAndKeys.Set(string(id), key)
+			return nil
+		}()
+		if err != nil {
+			return err
+		}
+	}
+
+	// now start listing for local connections and forward them
+	return WebsocketListenClient(serverUrl)
 }
 
 // check and fix arguments
@@ -474,6 +547,12 @@ func FixAndCheckArguments() error {
 		RSAPublicPem = crypt.RSAPublicKeyToBytes(&RSAPrivateKey.PublicKey)
 		log.Info("Done generating a RSA-2048 key pair")
 	}
+	// hash the password if needed
+	if KeyAgreement == "sha-256" {
+		hashed := sha256.Sum256([]byte(Password))
+		Password = string(hashed[:]) // you might think why this guy is converting a binary data to string? If I used []byte, when I would have used bytes.Equal that this function does in fact convert byte slices to string
+		log.Trace("Key is ", base64.StdEncoding.EncodeToString(hashed[:]))
+	}
 	return nil
 }
 
@@ -485,4 +564,19 @@ func StringArrayContains(array []string, toCheck string) bool {
 		}
 	}
 	return false
+}
+
+// parse shadowsocks arguments
+func ParseShadowsocksOptions(arg string) map[string]string {
+	res := make(map[string]string)
+	split := strings.Split(arg, ";") // at first split the args
+	for _, v := range split {
+		keyValue := strings.Split(v, "=")
+		if len(keyValue) == 1 { // these are bool values
+			res[keyValue[0]] = ""
+		} else {
+			res[keyValue[0]] = keyValue[1]
+		}
+	}
+	return res
 }
