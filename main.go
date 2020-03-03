@@ -389,6 +389,9 @@ func StartClient() error {
 				IdAndKeys.Set(string(id), key)
 				return nil
 			}()
+			if err != nil {
+				return err
+			}
 		}
 		// start listing
 		return TCPStartListen()

@@ -18,7 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"sync"
+	"strings"
 )
 
 // all clients are redirected here
@@ -29,9 +29,9 @@ func WebsocketBase(w http.ResponseWriter, r *http.Request) {
 		log.Error("Cannot upgrade: ", err.Error())
 		return
 	}
-	defer log.WithField("client", conn.RemoteAddr()).Trace("Closing connection")
+	defer log.WithField("client", conn.RemoteAddr()).Debug("Closed connection")
 	defer conn.Close()
-	log.WithField("from", r.RemoteAddr).Trace("New connection")
+	log.WithField("from", r.RemoteAddr).Debug("New connection")
 
 	// do the handshake just like tcp
 	salt := make([]byte, 8)
@@ -192,9 +192,11 @@ startTransfer:
 
 	// start transfer
 	var err2 error
-	mu := sync.Mutex{} // this is used to sync the errors
-	go func() {        // get the data from proxy; server -> client; These data must be encrypted
-		mu.Lock()
+	done := make(chan bool, 1)
+	go func() { // get the data from proxy; server -> client; These data must be encrypted
+		defer close(done)
+		defer conn.Close()
+		defer proxy.Close()
 		var nr, i int
 		buf := make([]byte, BufferSize) // this is only used in reading from proxy
 		if Encryption == "xor" {        // this is only for performance. Once for all define if you we are going to use AEAD interface or xor
@@ -241,9 +243,6 @@ startTransfer:
 					cipherText = c.Seal(nil, nonce, buf[:nr], nil)                // encrypt data
 					cipherText = append(nonce, cipherText...)                     // add nonce
 					err2 = conn.WriteMessage(websocket.BinaryMessage, cipherText) // send to client
-					if err2 != nil {
-						break
-					}
 				}
 				if err2 != nil {
 					if err2 == io.EOF {
@@ -253,7 +252,6 @@ startTransfer:
 				}
 			}
 		}
-		mu.Unlock()
 	}()
 	// client -> server ; must be decrypted
 	if Encryption == "xor" {
@@ -311,11 +309,17 @@ startTransfer:
 			}
 		}
 	}
-	mu.Lock() // wait until mutex is free; no need to unlock. It will be gone with GC
-	if err2 != nil {
+
+	proxy.Close()
+	conn.Close()
+	select {
+	case <-done: // wait until it's over
+	}
+
+	if err2 != nil && !strings.Contains(err2.Error(), "use of closed network connection") {
 		log.WithField("error", err2.Error()).Debug("Error on copy (server -> client)")
 	}
-	if err != nil {
+	if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
 		log.WithField("error", err.Error()).Debug("Error on copy (client -> server)")
 	}
 }
@@ -350,6 +354,7 @@ func WebsocketHandleClientConnection(conn net.Conn, serverUrl url.URL) {
 		log.Error("Cannot dial ", To, ": ", err.Error())
 		return
 	}
+	defer log.WithField("client", conn.RemoteAddr()).Debug("Closed connection")
 	defer srv.Close()
 
 	var key []byte // is always 256 bit
@@ -428,9 +433,11 @@ func WebsocketHandleClientConnection(conn net.Conn, serverUrl url.URL) {
 
 	// now start coping
 	var err2 error
-	mu := sync.Mutex{} // this is used to sync the errors
+	done := make(chan bool, 1)
 	go func() {
-		mu.Lock()
+		defer close(done)
+		defer conn.Close()
+		defer srv.Close()
 		// server -> client ; must be decrypted
 		var message []byte
 		if Encryption == "xor" {
@@ -494,7 +501,6 @@ func WebsocketHandleClientConnection(conn net.Conn, serverUrl url.URL) {
 				}
 			}
 		}
-		mu.Unlock()
 	}()
 
 	// client -> server ; must be encrypted. Use default buffer size
@@ -558,11 +564,17 @@ func WebsocketHandleClientConnection(conn net.Conn, serverUrl url.URL) {
 			}
 		}
 	}
-	mu.Lock() // wait until mutex is free; no need to unlock. It will be gone with GC
-	if err2 != nil {
+
+	conn.Close()
+	srv.Close()
+	select {
+	case <-done: // wait until it's over
+	}
+
+	if err2 != nil && !strings.Contains(err2.Error(), "use of closed network connection") {
 		log.WithField("error", err2.Error()).Debug("Error on copy (server -> client)")
 	}
-	if err != nil {
+	if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
 		log.WithField("error", err.Error()).Debug("Error on copy (client -> server)")
 	}
 }

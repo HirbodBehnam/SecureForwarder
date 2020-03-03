@@ -16,7 +16,7 @@ import (
 	"golang.org/x/crypto/scrypt"
 	"io"
 	"net"
-	"sync"
+	"strings"
 )
 
 // stating listing for connections to send them to client or server
@@ -48,7 +48,7 @@ func TCPStartListen() error {
 
 // do the key agreement and handshake and at last, start coping
 func TCPHandleForwardServer(conn net.Conn) { // forward all connections
-	defer log.WithField("client", conn.RemoteAddr()).Trace("Closing connection")
+	defer log.WithField("client", conn.RemoteAddr()).Debug("Closed connection")
 	defer conn.Close()
 	var err error
 	salt := make([]byte, 8)
@@ -214,18 +214,25 @@ startTransfer:
 
 	// start transfer
 	var err2 error
-	mu := sync.Mutex{} // this is used to sync the errors
+	done := make(chan bool, 1)
 	go func() {
-		mu.Lock()
 		err2 = TCPCopyConnectionDecrypt(conn, proxy, key) // client -> server ; must be decrypted. Use larger buffer size (same size for xor, larger for xor and +12 bytes for chacha and aes)
-		mu.Unlock()
+		conn.Close()
+		proxy.Close()
+		close(done)
 	}()
 	err = TCPCopyConnectionEncrypt(proxy, conn, key) // server -> client ; must be encrypted. Use default buffer size
-	mu.Lock()                                        // wait until mutex is free; no need to unlock. It will be gone with GC
-	if err != nil {
+
+	conn.Close()
+	proxy.Close()
+	select {
+	case <-done:
+	}
+
+	if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
 		log.WithField("error", err.Error()).Debug("Error on copy (server -> client)")
 	}
-	if err2 != nil {
+	if err2 != nil && !strings.Contains(err2.Error(), "use of closed network connection") {
 		log.WithField("error", err2.Error()).Debug("Error on copy (client -> server)")
 	}
 }
@@ -238,7 +245,7 @@ func TCPHandleForwardClient(conn net.Conn) {
 		log.Error("Cannot dial ", To, ": ", err.Error())
 		return
 	}
-	defer log.WithField("proxy", conn.RemoteAddr()).Trace("Closing connection")
+	defer log.WithField("proxy", conn.RemoteAddr()).Debug("Closed connection")
 	defer srv.Close()
 
 	var key []byte // is always 256 bit
@@ -321,19 +328,26 @@ func TCPHandleForwardClient(conn net.Conn) {
 
 	// now start coping
 	var err2 error
-	mu := sync.Mutex{} // this is used to sync the errors
+	done := make(chan bool, 1)
 	go func() {
-		mu.Lock()
 		err2 = TCPCopyConnectionDecrypt(srv, conn, key) // server -> client ; must be decrypted. Use larger buffer size (same size for xor, larger for xor and +12 bytes for chacha and aes)
-		mu.Unlock()
+		srv.Close()
+		conn.Close()
+		close(done)
 	}()
 	err = TCPCopyConnectionEncrypt(conn, srv, key) // client -> server ; must be encrypted. Use default buffer size
-	mu.Lock()                                      // wait until mutex is free; no need to unlock. It will be gone with GC
-	if err2 != nil {
-		log.WithField("error", err2.Error()).Debug("Error on copy (server -> client)")
+
+	srv.Close()
+	conn.Close()
+	select {
+	case <-done:
 	}
-	if err != nil {
+
+	if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
 		log.WithField("error", err.Error()).Debug("Error on copy (client -> server)")
+	}
+	if err2 != nil && !strings.Contains(err2.Error(), "use of closed network connection") {
+		log.WithField("error", err2.Error()).Debug("Error on copy (server -> client)")
 	}
 }
 
