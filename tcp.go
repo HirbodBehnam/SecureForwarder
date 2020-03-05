@@ -240,7 +240,7 @@ startTransfer:
 // do the key agreement with server and start sending
 func TCPHandleForwardClient(conn net.Conn) {
 	// at first connect to server
-	srv, err := net.Dial("tcp", To)
+	srv, err := tcpDialer.Dial("tcp", To)
 	if err != nil {
 		log.Error("Cannot dial ", To, ": ", err.Error())
 		return

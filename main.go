@@ -2,6 +2,7 @@ package main
 
 import (
 	"SecureForwarder/crypt"
+	"context"
 	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -24,8 +25,9 @@ import (
 )
 
 var (
-	upgrader = websocket.Upgrader{}
-	dialer   = websocket.Dialer{}
+	upgrader  = websocket.Upgrader{}
+	wsDialer  = websocket.Dialer{}
+	tcpDialer = net.Dialer{}
 )
 
 var IdAndKeys cmap.ConcurrentMap
@@ -55,6 +57,7 @@ const VERSION = "1.0.0 / Build 1"
 
 func main() {
 	IdAndKeys = cmap.New()
+	logInit()
 
 	if os.Getenv("SS_LOCAL_HOST") != "" { // check if the program is running as shadowsocks plugin
 		var exists bool
@@ -302,11 +305,13 @@ func StartClient() error {
 	}).Debug()
 	// start listening according to type of transfer type
 	if TransferType == "tcp" { // use raw tcp
+		// make sure we do not loopback connection on ss android
+		tcpDialer.Control = protector
 		// before to start listening for connection do the handshake if needed
 		if KeyAgreement == "pbkdf2" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // these algorithms need handshake
 			err = func() error {
 				id := make([]byte, 8)
-				srv, err := net.Dial("tcp", To) // connect to server
+				srv, err := tcpDialer.Dial("tcp", To) // connect to server
 				if err != nil {
 					log.Error("Cannot dial when client wanted to handshake")
 					return err
@@ -397,19 +402,25 @@ func StartClient() error {
 		return TCPStartListen()
 	}
 	// set websocket buffers
-	dialer.WriteBufferSize = BufferSize + 28
-	dialer.ReadBufferSize = BufferSize + 28
+	wsDialer.WriteBufferSize = BufferSize + 28
+	wsDialer.ReadBufferSize = BufferSize + 28
+	{ // prevent loopback
+		netDialer := &net.Dialer{Control: protector}
+		wsDialer.NetDial = func(network, addr string) (net.Conn, error) {
+			return netDialer.DialContext(context.Background(), network, addr)
+		}
+	}
 	// at first check the certificate verification and create URL
 	serverUrl := url.URL{Scheme: TransferType, Host: To, Path: "/"}
 	if TrustCert {
 		log.Debug("Trusting all certs")
-		dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		wsDialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 	// before to start listening for connection do the handshake if needed
 	if KeyAgreement == "pbkdf2" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // these algorithms need handshake
 		err = func() error {
 			id := make([]byte, 8)
-			srv, _, err := dialer.Dial(serverUrl.String(), nil)
+			srv, _, err := wsDialer.Dial(serverUrl.String(), nil)
 			if err != nil {
 				log.Error("Cannot dial when client wanted to handshake")
 				return err

@@ -349,7 +349,7 @@ func WebsocketListenClient(serverUrl url.URL) error {
 
 func WebsocketHandleClientConnection(conn net.Conn, serverUrl url.URL) {
 	// at first connect to server
-	srv, _, err := dialer.Dial(serverUrl.String(), nil)
+	srv, _, err := wsDialer.Dial(serverUrl.String(), nil)
 	if err != nil {
 		log.Error("Cannot dial ", To, ": ", err.Error())
 		return
