@@ -1012,6 +1012,7 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 	mutex := sync.Mutex{}
 	// listen for incoming packets; server -> client must be decrypted
 	go func() {
+		defer log.Fatal("Main reader loop exited")
 		var connId uint16
 		if Encryption == "xor" {
 			var message []byte
