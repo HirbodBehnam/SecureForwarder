@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 )
 
 // all clients are redirected here
@@ -445,6 +446,7 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 	// packets are like this: 1byte cmd + 2byte id
 	lastIndex := uint16(0)
 	connectionMap := make(map[uint16]*net.Conn)
+	mutex := sync.Mutex{}
 
 	// define server -> client function
 	ServerToClient := func(myIndex uint16) {
@@ -452,7 +454,12 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 		indexByte := make([]byte, 2)
 		binary.LittleEndian.PutUint16(indexByte, myIndex)
 		muxPacket := []byte{muxPSH, indexByte[0], indexByte[1]}
-		defer conn.WriteMessage(websocket.BinaryMessage, []byte{muxFIN, indexByte[0], indexByte[1]})
+		defer func() {
+			log.WithField("id", myIndex).Debug("sending muxFin")
+			mutex.Lock()
+			_ = conn.WriteMessage(websocket.BinaryMessage, []byte{muxFIN, indexByte[0], indexByte[1]})
+			mutex.Unlock()
+		}()
 		var nr, i int
 		var innerError error
 		buf := make([]byte, BufferSize) // this is only used in reading from proxy
@@ -465,7 +472,9 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 					}
 					// add mux
 					buf = append(muxPacket, buf...)
+					mutex.Lock()
 					innerError = conn.WriteMessage(websocket.BinaryMessage, buf[:nr+3]) // send to client
+					mutex.Unlock()
 				}
 				if innerError != nil {
 					if innerError == io.EOF {
@@ -505,7 +514,9 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 					copy(finalPacket, muxPacket)
 					copy(finalPacket[3:], nonce)
 					copy(finalPacket[3+12:], cipherText)
+					mutex.Lock()
 					innerError = conn.WriteMessage(websocket.BinaryMessage, finalPacket) // send to client
+					mutex.Unlock()
 				}
 				if innerError != nil {
 					if innerError == io.EOF {
@@ -548,6 +559,7 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 			case muxFIN: // close connection
 				connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
 				(*connectionMap[connId]).Close()
+				log.WithField("id", connId).Println("got muxFin")
 				continue
 			case muxPSH: // push data
 				connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
@@ -996,6 +1008,7 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 
 	lastIndex := uint16(0)
 	connectionMap := make(map[uint16]*net.Conn)
+	mutex := sync.Mutex{}
 	// listen for incoming packets; server -> client must be decrypted
 	go func() {
 		var connId uint16
@@ -1058,6 +1071,7 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 				case muxFIN: // close connection
 					connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
 					(*connectionMap[connId]).Close()
+					log.WithField("id", connId).Println("got muxFin")
 					continue
 				case muxPSH: // push data
 					connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
@@ -1104,10 +1118,17 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 			var innerError error
 			defer log.WithField("conn", conn.RemoteAddr()).Debug("closing local connection")
 			defer conn.Close()
-			defer srv.WriteMessage(websocket.BinaryMessage, []byte{muxFIN, byteIndex[0], byteIndex[1]}) // terminate mux
+			defer func() {
+				log.WithField("id", index).Debug("sending muxFin")
+				mutex.Lock()
+				_ = srv.WriteMessage(websocket.BinaryMessage, []byte{muxFIN, byteIndex[0], byteIndex[1]}) // terminate mux
+				mutex.Unlock()
+			}()
 			// send muxSYC
 			connectionMap[index] = &conn
+			mutex.Lock()
 			innerError = srv.WriteMessage(websocket.BinaryMessage, []byte{muxSYC})
+			mutex.Unlock()
 			if innerError != nil {
 				log.Error("cannot send mux hello to server")
 				return
@@ -1124,7 +1145,9 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 						}
 						// add mux
 						buf = append(pushPacket, buf...)
+						mutex.Lock()
 						innerError = srv.WriteMessage(websocket.BinaryMessage, buf[:nr+3]) // send to client
+						mutex.Unlock()
 					}
 					if innerError != nil {
 						if innerError == io.EOF {
@@ -1164,7 +1187,9 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 						copy(finalPacket, pushPacket)
 						copy(finalPacket[3:], nonce)
 						copy(finalPacket[3+12:], cipherText)
+						mutex.Lock()
 						innerError = srv.WriteMessage(websocket.BinaryMessage, finalPacket) // send to client
+						mutex.Unlock()
 					}
 					if innerError != nil {
 						if innerError == io.EOF {
