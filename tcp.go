@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"github.com/HirbodBehnam/EasyX25519"
 	log "github.com/sirupsen/logrus"
+	"github.com/xtaci/smux"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/pbkdf2"
@@ -39,15 +40,192 @@ func TCPStartListen() error {
 
 		log.WithField("from", conn.RemoteAddr()).Debug("Accepting a connection")
 		if ServerApp {
-			go TCPHandleForwardServer(conn)
+			if Multiplex {
+				go TCPHandleForwardServerMultiplex(conn)
+			} else {
+				go TCPHandleForwardServerRaw(conn)
+			}
 		} else {
-			go TCPHandleForwardClient(conn)
+			go TCPHandleForwardClientRaw(conn)
 		}
 	}
 }
 
+// for each connection key agreement is only done once and at the beginning of the connection before mux
+func TCPHandleForwardServerMultiplex(conn net.Conn) {
+	defer log.WithField("client", conn.RemoteAddr()).Debug("Closed connection")
+	defer conn.Close()
+
+	var err error
+	salt := make([]byte, 8)
+	var key []byte // is always 256 bit
+
+	// do the handshake
+	// perform rsa handshake
+	if KeyAgreement == "x25519" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" {
+		_, err = conn.Write(RSAPublicPem) // on client we use big buffer (8*1024) because in future I might add something to change the key size
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot write public key to client")
+			return
+		}
+		{ // read the client's response that must be RSA encrypted password
+			tBuf := make([]byte, 8*1024)
+			readC, err := conn.Read(tBuf)
+			if err != nil {
+				log.WithField("error", err.Error()).Error("Cannot read clients response on RSA handshake")
+				return
+			}
+			// try to decrypt the password
+			decrypted, err := crypt.RSADecryptWithPrivateKey(tBuf[:readC], RSAPrivateKey)
+			if err != nil {
+				log.WithFields(log.Fields{
+					"from":  conn.RemoteAddr(),
+					"error": err.Error(),
+				}).Error("Invalid handshake")
+				return
+			}
+			// check if the password was correct
+			if string(decrypted) != Password {
+				log.WithField("from", conn.RemoteAddr()).Error("Invalid password")
+				return
+			}
+		}
+	}
+
+	switch KeyAgreement {
+	case "sha-256":
+		key = []byte(Password) // that's it :D
+	case "x25519": // this type is little different
+		// at first generate a x25519 key pair (client also creates one meanwhile)
+		xKey, err := x25519.NewX25519()
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot generate X25519 key pair")
+			return
+		}
+		// send the public key to client
+		_, err = conn.Write(xKey.PublicKey)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot send public key to client")
+			return
+		}
+		// get the public key of the user
+		otherPub := make([]byte, 32) // key is always 32 byte
+		_, err = conn.Read(otherPub)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot get client's X25519 public key")
+			return
+		}
+		// generate secret
+		key, err = xKey.GenerateSharedSecret(otherPub)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot do the final key agreement")
+			return
+		}
+	case "pbkdf2":
+		// generate salt
+		_, _ = rand.Read(salt)
+		// now generate the key
+		key = pbkdf2.Key([]byte(Password), salt, 1024*16, 32, sha1.New)
+		// send salt to user
+		_, err = conn.Write(salt)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot send salt to client")
+			return
+		}
+	case "scrypt":
+		// generate salt
+		_, _ = rand.Read(salt)
+		// send salt to user
+		_, err = conn.Write(salt)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot send salt to client")
+			return
+		}
+		// generate the key
+		key, err = scrypt.Key([]byte(Password), salt, 1<<14, 8, 1, 32)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot create key from scrypt")
+			return
+		}
+	case "argon2":
+		// it's better to use 16 byte salt for argon2
+		salt = make([]byte, 16)
+		_, _ = rand.Read(salt)
+		// send salt to user
+		_, err = conn.Write(salt)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot send salt to client")
+			return
+		}
+		// generate the key
+		key = argon2.IDKey([]byte(Password), salt, 10, 1<<14, 2, 32)
+	}
+
+	log.Trace("Key is ", base64.StdEncoding.EncodeToString(key))
+
+	// start the mux server
+	session, err := smux.Server(conn, nil) // just in case increase buffer size
+	if err != nil {
+		log.WithField("error", err.Error()).Error("cannot do the mux handshake")
+		return
+	}
+	defer session.Close()
+
+	log.Trace("listening for mux connection")
+	for {
+		// accept a connection
+		stream, err := session.AcceptStream()
+		if err != nil {
+			log.WithField("error", err.Error()).Error("cannot accept stream connection in mux")
+			return
+		}
+		log.WithField("mux_id", stream.ID()).Debug("new mux connection")
+		// dial destination and start coping
+		go func(s *smux.Stream) {
+			defer log.WithField("mux_id", s.ID()).Debug("multiplex stream closed")
+			defer s.Close()
+
+			// at first dial the destination
+			proxy, err := net.Dial("tcp", To)
+			if err != nil {
+				log.WithFields(log.Fields{
+					"error": err.Error(),
+					"to":    To,
+				}).Error("Cannot dial proxy")
+				return
+			}
+			defer proxy.Close()
+
+			// start transfer
+			var err2 error
+			done := make(chan bool, 1)
+			go func() {
+				err2 = TCPCopyConnectionDecrypt(s, proxy, key) // client -> server ; must be decrypted. Use larger buffer size (same size for xor, larger for xor and +12 bytes for chacha and aes)
+				s.Close()
+				proxy.Close()
+				close(done)
+			}()
+			err = TCPCopyConnectionEncrypt(proxy, s, key) // server -> client ; must be encrypted. Use default buffer size
+
+			s.Close()
+			proxy.Close()
+			select {
+			case <-done:
+			}
+
+			if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+				log.WithField("error", err.Error()).Debug("Error on copy (server -> client)")
+			}
+			if err2 != nil && !strings.Contains(err2.Error(), "use of closed network connection") {
+				log.WithField("error", err2.Error()).Debug("Error on copy (client -> server)")
+			}
+		}(stream)
+	}
+
+}
+
 // do the key agreement and handshake and at last, start coping
-func TCPHandleForwardServer(conn net.Conn) { // forward all connections
+func TCPHandleForwardServerRaw(conn net.Conn) { // forward all connections
 	defer log.WithField("client", conn.RemoteAddr()).Debug("Closed connection")
 	defer conn.Close()
 	var err error
@@ -237,8 +415,170 @@ startTransfer:
 	}
 }
 
+// do the handshake here and start listening
+func TCPHandleForwardClientMux() error {
+	// connect to server
+	srv, err := tcpDialer.Dial("tcp", To)
+	if err != nil {
+		return err
+	}
+	defer srv.Close()
+
+	var key []byte // is always 256 bit
+	salt := make([]byte, 8)
+
+	// perform the rsa handshake if needed
+	if KeyAgreement == "scrypt" || KeyAgreement == "argon2" || KeyAgreement == "x25519" { // in theses methods we should get the RSA key and encrypt out password with it
+		rsaPem := make([]byte, 1024*4)     // 16384 bit RSA is 2880 bytes. Just make sure that there is enough buffer to read the key
+		readCount, err := srv.Read(rsaPem) // read the RSA public key
+		if err != nil {
+			log.Error("Cannot get the public key of server: ", err.Error())
+			return err
+		}
+		pubKey, err := crypt.RSABytesToPublicKey(rsaPem[:readCount]) // pem to public key
+		if err != nil {
+			log.Error("Cannot convert public key of server: ", err.Error())
+			return err
+		}
+
+		// encrypt the password
+		encryptedPass, err := crypt.RSAEncryptWithPublicKey([]byte(Password), pubKey)
+		if err != nil {
+			log.Error("Cannot convert public key of server: ", err.Error())
+			return err
+		}
+		_, err = srv.Write(encryptedPass)
+		if err != nil {
+			log.Error("Cannot send encrypted password to server: ", err.Error())
+			return err
+		}
+	}
+
+	switch KeyAgreement {
+	case "sha-256":
+		key = []byte(Password) // that's it :D
+	case "x25519":
+		salt = make([]byte, 32) // salt here is public key of server
+		// at first generate a x25519 key pair (server also creates one meanwhile)
+		xKey, err := x25519.NewX25519()
+		if err != nil {
+			log.WithField("error", err.Error()).Error("cannot generate X25519 key pair")
+			return err
+		}
+		// read the servers public key
+		_, err = srv.Read(salt)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("cannot get server's X25519 public key")
+			return err
+		}
+		// send the public key to server
+		_, err = srv.Write(xKey.PublicKey)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot send public key to server")
+			return err
+		}
+		// generate secret
+		key, err = xKey.GenerateSharedSecret(salt)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot do the final key agreement")
+			return err
+		}
+	case "pbkdf2":
+		// server sends a 8 byte salt to us
+		_, err = srv.Read(salt)
+		if err != nil {
+			log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
+			return err
+		}
+		// generate shared key
+		key = pbkdf2.Key([]byte(Password), salt, 1024*16, 32, sha1.New)
+	case "scrypt":
+		// server sends a 8 byte salt to us
+		_, err = srv.Read(salt)
+		if err != nil {
+			log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
+			return err
+		}
+		// generate shared key
+		key, err = scrypt.Key([]byte(Password), salt, 1<<14, 8, 1, 32)
+	case "argon2":
+		// server sends a 16 byte salt to us
+		salt = make([]byte, 16)
+		_, err = srv.Read(salt)
+		if err != nil {
+			log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
+			return err
+		}
+		// generate shared key
+		key = argon2.IDKey([]byte(Password), salt, 10, 1<<14, 2, 32)
+	}
+	log.Trace("Key is ", base64.StdEncoding.EncodeToString(key))
+
+	// start mux client
+	session, err := smux.Client(srv, nil)
+	if err != nil {
+		log.WithField("error", err.Error()).Error("cannot get start mux client")
+		return err
+	}
+	defer session.Close()
+
+	// start listener for local connections
+	log.Info("starting TCP listener on ", InterfaceAddress+":"+Port)
+	listener, err := net.Listen("tcp", InterfaceAddress+":"+Port) // listen on the port and interface for connections
+	if err != nil {
+		return err
+	}
+
+	for {
+		local, err := listener.Accept() // accept incoming connections
+		if err != nil {
+			log.WithFields(log.Fields{
+				"from":  local.RemoteAddr(),
+				"error": err.Error(),
+			}).Error("Could not accept an incoming connection")
+			continue
+		}
+
+		log.WithField("from", local.RemoteAddr()).Debug("Accepting a connection")
+		go func(conn net.Conn) {
+			defer log.WithField("conn", conn.RemoteAddr()).Debug("closing connection")
+			defer conn.Close()
+			stream, err := session.OpenStream()
+			if err != nil {
+				log.WithField("error", err.Error()).Error("cannot open stream")
+				return
+			}
+
+			var err2 error
+			done := make(chan bool, 1)
+			go func() {
+				err2 = TCPCopyConnectionDecrypt(stream, conn, key) // server -> client ; must be decrypted. Use larger buffer size (same size for xor, larger for xor and +12 bytes for chacha and aes)
+
+				stream.Close()
+				conn.Close()
+				close(done)
+			}()
+			err = TCPCopyConnectionEncrypt(conn, stream, key) // client -> server ; must be encrypted. Use default buffer size
+
+			stream.Close()
+			conn.Close()
+			select {
+			case <-done:
+			}
+
+			if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+				log.WithField("error", err.Error()).Debug("Error on copy (client -> server)")
+			}
+			if err2 != nil && !strings.Contains(err2.Error(), "use of closed network connection") {
+				log.WithField("error", err2.Error()).Debug("Error on copy (server -> client)")
+			}
+		}(local)
+	}
+}
+
 // do the key agreement with server and start sending
-func TCPHandleForwardClient(conn net.Conn) {
+func TCPHandleForwardClientRaw(conn net.Conn) {
+	defer conn.Close()
 	// at first connect to server
 	srv, err := tcpDialer.Dial("tcp", To)
 	if err != nil {

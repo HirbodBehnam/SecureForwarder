@@ -46,11 +46,19 @@ var (
 	KeyPath          string // tls key path; Used only with wss connections
 	ServerApp        bool   // is this running as server application
 	TrustCert        bool   // trust unverified certs? (for wss only)
+	Multiplex        bool   // shall we multiplex connections?
 )
 
 var (
 	RSAPublicPem  []byte
 	RSAPrivateKey *rsa.PrivateKey
+)
+
+// mux variables for websocket
+const (
+	muxSYC = byte(0) // hello
+	muxFIN = byte(1) // close connection
+	muxPSH = byte(2) // push data
 )
 
 const VERSION = "1.0.0 / Build 1"
@@ -93,6 +101,8 @@ func main() {
 		if Loglevel, exists = args["loglevel"]; !exists {
 			Loglevel = "info"
 		}
+		// parse multiplexing
+		_, Multiplex = args["mux"]
 		// parse IP and etc
 		if ServerApp { // server mode
 			if To, exists = args["host"]; exists {
@@ -201,6 +211,14 @@ func main() {
 				Value:       "info",
 				Destination: &Loglevel,
 			},
+			&cli.BoolFlag{
+				Name:        "multiplex",
+				Aliases:     []string{"m"},
+				Usage:       "Use multiplex all connections into one connection",
+				Required:    false,
+				Value:       false,
+				Destination: &Multiplex,
+			},
 		},
 		Commands: []*cli.Command{
 			{
@@ -275,14 +293,22 @@ func StartServer() error {
 		upgrader.ReadBufferSize = BufferSize + 28 // no need to add 28 but it's fine
 		upgrader.WriteBufferSize = BufferSize + 28
 		// create ws server
-		http.HandleFunc("/", WebsocketBase)
+		if Multiplex {
+			http.HandleFunc("/", WebsocketBaseMux)
+		} else {
+			http.HandleFunc("/", WebsocketBaseRaw)
+		}
 		log.Info("starting WS listener on ", InterfaceAddress+":"+Port)
 		return http.ListenAndServe(InterfaceAddress+":"+Port, nil)
 	case "wss": // use secure websocket
 		upgrader.ReadBufferSize = BufferSize + 28 // no need to add 28 but it's fine
 		upgrader.WriteBufferSize = BufferSize + 28
 		// create ws server
-		http.HandleFunc("/", WebsocketBase)
+		if Multiplex {
+			http.HandleFunc("/", WebsocketBaseMux)
+		} else {
+			http.HandleFunc("/", WebsocketBaseRaw)
+		}
 		log.Info("starting WSS listener on ", InterfaceAddress+":"+Port)
 		return http.ListenAndServeTLS(InterfaceAddress+":"+Port, CertPath, KeyPath, nil)
 	}
@@ -307,6 +333,10 @@ func StartClient() error {
 	if TransferType == "tcp" { // use raw tcp
 		// make sure we do not loopback connection on ss android
 		tcpDialer.Control = protector
+		// handle mux if needed
+		if Multiplex {
+			return TCPHandleForwardClientMux()
+		}
 		// before to start listening for connection do the handshake if needed
 		if KeyAgreement == "pbkdf2" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // these algorithms need handshake
 			err = func() error {
@@ -416,6 +446,10 @@ func StartClient() error {
 		log.Debug("Trusting all certs")
 		wsDialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
+	// use mutex if needed
+	if Multiplex {
+		return WebsocketListenClientMux(serverUrl)
+	}
 	// before to start listening for connection do the handshake if needed
 	if KeyAgreement == "pbkdf2" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" { // these algorithms need handshake
 		err = func() error {
@@ -507,7 +541,7 @@ func StartClient() error {
 	}
 
 	// now start listing for local connections and forward them
-	return WebsocketListenClient(serverUrl)
+	return WebsocketListenClientRaw(serverUrl)
 }
 
 // check and fix arguments

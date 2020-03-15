@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
+	"encoding/binary"
 	x25519 "github.com/HirbodBehnam/EasyX25519"
 	"github.com/gorilla/websocket"
 	log "github.com/sirupsen/logrus"
@@ -22,7 +23,7 @@ import (
 )
 
 // all clients are redirected here
-func WebsocketBase(w http.ResponseWriter, r *http.Request) {
+func WebsocketBaseRaw(w http.ResponseWriter, r *http.Request) {
 	// at first accept the websocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -324,8 +325,318 @@ startTransfer:
 	}
 }
 
+func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
+	// at first accept the websocket
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Error("Cannot upgrade: ", err.Error())
+		return
+	}
+	defer log.WithField("client", conn.RemoteAddr()).Debug("Closed connection")
+	defer conn.Close()
+	log.WithField("from", r.RemoteAddr).Debug("New connection")
+
+	salt := make([]byte, 8)
+	var key []byte // is always 256 bit
+
+	// do the handshake
+	// perform rsa handshake
+	if KeyAgreement == "x25519" || KeyAgreement == "scrypt" || KeyAgreement == "argon2" {
+		err = conn.WriteMessage(websocket.TextMessage, RSAPublicPem) // on client we use big buffer (8*1024) because in future I might add something to change the key size
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot write public key to client")
+			return
+		}
+		{ // read the client's response that must be RSA encrypted password
+			_, tBuf, err := conn.ReadMessage()
+			if err != nil {
+				log.WithField("error", err.Error()).Error("Cannot read clients response on RSA handshake")
+				return
+			}
+			// try to decrypt the password
+			decrypted, err := crypt.RSADecryptWithPrivateKey(tBuf, RSAPrivateKey)
+			if err != nil {
+				log.WithFields(log.Fields{
+					"from":  conn.RemoteAddr(),
+					"error": err.Error(),
+				}).Error("Invalid handshake")
+				return
+			}
+			// check if the password was correct
+			if string(decrypted) != Password {
+				log.WithField("from", conn.RemoteAddr()).Error("Invalid password")
+				return
+			}
+		}
+	}
+
+	switch KeyAgreement {
+	case "sha-256":
+		key = []byte(Password) // that's it :D
+	case "x25519": // this type is little different
+		// at first generate a x25519 key pair (client also creates one meanwhile)
+		xKey, err := x25519.NewX25519()
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot generate X25519 key pair")
+			return
+		}
+		// send the public key to client
+		err = conn.WriteMessage(websocket.BinaryMessage, xKey.PublicKey)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot send public key to client")
+			return
+		}
+		// get the public key of the user
+		otherPub := make([]byte, 32) // key is always 32 byte
+		err = conn.WriteMessage(websocket.BinaryMessage, otherPub)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot get client's X25519 public key")
+			return
+		}
+		// generate secret
+		key, err = xKey.GenerateSharedSecret(otherPub)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot do the final key agreement")
+			return
+		}
+	case "pbkdf2":
+		// generate salt
+		_, _ = rand.Read(salt)
+		// now generate the key
+		key = pbkdf2.Key([]byte(Password), salt, 1024*16, 32, sha1.New)
+		// send salt to user
+		err = conn.WriteMessage(websocket.BinaryMessage, salt)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot send salt to client")
+			return
+		}
+	case "scrypt":
+		// generate salt
+		_, _ = rand.Read(salt)
+		// send salt to user
+		err = conn.WriteMessage(websocket.BinaryMessage, salt)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot send salt to client")
+			return
+		}
+		// generate the key
+		key, err = scrypt.Key([]byte(Password), salt, 1<<14, 8, 1, 32)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot create key from scrypt")
+			return
+		}
+	case "argon2":
+		// it's better to use 16 byte salt for argon2
+		salt = make([]byte, 16)
+		_, _ = rand.Read(salt)
+		// send salt to user
+		err = conn.WriteMessage(websocket.BinaryMessage, salt)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot send salt to client")
+			return
+		}
+		// generate the key
+		key = argon2.IDKey([]byte(Password), salt, 10, 1<<14, 2, 32)
+	}
+
+	log.Trace("Key is ", base64.StdEncoding.EncodeToString(key))
+
+	// now start the mux server and listen to connections
+	// packets are like this: 1byte cmd + 2byte id
+	lastIndex := uint16(0)
+	connectionMap := make(map[uint16]*net.Conn)
+
+	// define server -> client function
+	ServerToClient := func(myIndex uint16) {
+		proxy := connectionMap[myIndex]
+		indexByte := make([]byte, 2)
+		binary.LittleEndian.PutUint16(indexByte, myIndex)
+		muxPacket := []byte{muxPSH, indexByte[0], indexByte[1]}
+		defer conn.WriteMessage(websocket.BinaryMessage, []byte{muxFIN, indexByte[0], indexByte[1]})
+		var nr, i int
+		var innerError error
+		buf := make([]byte, BufferSize) // this is only used in reading from proxy
+		if Encryption == "xor" {        // this is only for performance. Once for all define if you we are going to use AEAD interface or xor
+			for {
+				nr, innerError = (*proxy).Read(buf) // read from proxy
+				if nr > 0 {
+					for i = 0; i < nr; i++ { // encrypt
+						buf[i] ^= key[i%32]
+					}
+					// add mux
+					buf = append(muxPacket, buf...)
+					innerError = conn.WriteMessage(websocket.BinaryMessage, buf[:nr+3]) // send to client
+				}
+				if innerError != nil {
+					if innerError == io.EOF {
+						innerError = nil
+					}
+					break
+				}
+			}
+		} else {
+			// ready encryption stuff
+			var c cipher.AEAD
+			var cipherText []byte
+			nonce := make([]byte, 12)
+			if Encryption == "aes" {
+				block, err := aes.NewCipher(key)
+				if err != nil {
+					return
+				}
+				c, err = cipher.NewGCM(block)
+				if err != nil {
+					return
+				}
+			} else { // chacha
+				c, err = chacha20poly1305.New(key)
+				if err != nil {
+					return
+				}
+			}
+			// start transfer
+			var finalPacket []byte
+			for {
+				nr, innerError = (*proxy).Read(buf)
+				if nr > 0 {
+					_, _ = rand.Read(nonce)
+					cipherText = c.Seal(nil, nonce, buf[:nr], nil)   // encrypt data
+					finalPacket = make([]byte, len(cipherText)+3+12) // add nonce and mux
+					copy(finalPacket, muxPacket)
+					copy(finalPacket[3:], nonce)
+					copy(finalPacket[3+12:], cipherText)
+					innerError = conn.WriteMessage(websocket.BinaryMessage, finalPacket) // send to client
+				}
+				if innerError != nil {
+					if innerError == io.EOF {
+						innerError = nil
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// start transfer
+	//go ServerToClient(0)
+
+	// client -> server ; must be decrypted
+	var connId uint16
+	if Encryption == "xor" {
+		var message []byte
+		var i, nr int
+		for {
+			_, message, err = conn.ReadMessage() // read the message
+			if err != nil {
+				break
+			}
+			// check the mux options : byte: cmd, uint16: connection id
+			switch message[0] {
+			case muxSYC: // new connection
+				lastIndex++ // last index will increase no matter if the connection is ok or not
+				// dial a new connection and save it
+				log.WithField("index", lastIndex).Trace("new mux session")
+				newProxy, err := net.Dial("tcp", To)
+				if err != nil {
+					log.Error("Cannot dial ", To, ": ", err.Error())
+					continue
+				}
+				connectionMap[lastIndex] = &newProxy
+				// start a listener for this proxy
+				go ServerToClient(lastIndex)
+				continue
+			case muxFIN: // close connection
+				connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
+				(*connectionMap[connId]).Close()
+				continue
+			case muxPSH: // push data
+				connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
+				// just continue in loop
+			}
+
+			message = message[3:]
+			nr = len(message)
+			for i = 0; i < nr; i++ { // decrypt
+				message[i] ^= key[i%32]
+			}
+
+			_, err = (*connectionMap[connId]).Write(message) // send to proxy
+			if err != nil {
+				break
+			}
+		}
+	} else {
+		var c cipher.AEAD
+		var plainText []byte
+		if Encryption == "aes" {
+			block, err := aes.NewCipher(key)
+			if err != nil {
+				return
+			}
+			c, err = cipher.NewGCM(block)
+			if err != nil {
+				return
+			}
+		} else { // chacha
+			c, err = chacha20poly1305.New(key)
+			if err != nil {
+				return
+			}
+		}
+		for {
+			_, message, err := conn.ReadMessage()
+			if err != nil {
+				break
+			}
+
+			// check mux
+			switch message[0] {
+			case muxSYC: // new connection
+				lastIndex++ // last index will increase no matter if the connection is ok or not
+				// dial a new connection and save it
+				log.WithField("index", lastIndex).Trace("new mux session")
+				newProxy, err := net.Dial("tcp", To)
+				if err != nil {
+					log.Error("Cannot dial ", To, ": ", err.Error())
+					continue
+				}
+				connectionMap[lastIndex] = &newProxy
+				// start a listener for this proxy
+				go ServerToClient(lastIndex)
+				continue
+			case muxFIN: // close connection
+				connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
+				(*connectionMap[connId]).Close()
+				continue
+			case muxPSH: // push data
+				connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
+				// just continue in loop
+			}
+
+			message = message[3:]
+			plainText, err = c.Open(nil, message[:12], message[12:], nil)
+			if err != nil {
+				log.WithFields(log.Fields{
+					"src":   conn.RemoteAddr(),
+					"dest":  (*connectionMap[connId]).RemoteAddr(),
+					"error": err.Error(),
+				}).Error("Error on decrypting data")
+				break
+			}
+			_, err = (*connectionMap[connId]).Write(plainText)
+			if err != nil {
+				break
+			}
+		}
+	}
+
+	if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+		log.WithField("error", err.Error()).Debug("Error on copy (client -> server)")
+	}
+}
+
 // listen for incoming connections in client to forward them
-func WebsocketListenClient(serverUrl url.URL) error {
+func WebsocketListenClientRaw(serverUrl url.URL) error {
 	log.Info("starting local TCP listener on ", InterfaceAddress+":"+Port)
 	listener, err := net.Listen("tcp", InterfaceAddress+":"+Port) // listen on the port and interface for connections
 	if err != nil {
@@ -347,6 +658,7 @@ func WebsocketListenClient(serverUrl url.URL) error {
 	}
 }
 
+// forwards the connections
 func WebsocketHandleClientConnection(conn net.Conn, serverUrl url.URL) {
 	// at first connect to server
 	srv, _, err := wsDialer.Dial(serverUrl.String(), nil)
@@ -576,5 +888,292 @@ func WebsocketHandleClientConnection(conn net.Conn, serverUrl url.URL) {
 	}
 	if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
 		log.WithField("error", err.Error()).Debug("Error on copy (client -> server)")
+	}
+}
+
+func WebsocketListenClientMux(serverUrl url.URL) error {
+	// at first connect to server
+	srv, _, err := wsDialer.Dial(serverUrl.String(), nil)
+	if err != nil {
+		log.Error("Cannot dial ", To, ": ", err.Error())
+		return err
+	}
+	defer srv.Close()
+
+	var key []byte // is always 256 bit
+	salt := make([]byte, 8)
+
+	// perform the rsa handshake if needed
+	if KeyAgreement == "scrypt" || KeyAgreement == "argon2" || KeyAgreement == "x25519" { // in theses methods we should get the RSA key and encrypt out password with it
+		_, rsaPem, err := srv.ReadMessage() // read the RSA public key
+		if err != nil {
+			log.Error("Cannot get the public key of server: ", err.Error())
+			return err
+		}
+		pubKey, err := crypt.RSABytesToPublicKey(rsaPem) // pem to public key
+		if err != nil {
+			log.Error("Cannot convert public key of server: ", err.Error())
+			return err
+		}
+
+		// encrypt the password
+		encryptedPass, err := crypt.RSAEncryptWithPublicKey([]byte(Password), pubKey)
+		if err != nil {
+			log.Error("Cannot convert public key of server: ", err.Error())
+			return err
+		}
+		err = srv.WriteMessage(websocket.BinaryMessage, encryptedPass)
+		if err != nil {
+			log.Error("Cannot send encrypted password to server: ", err.Error())
+			return err
+		}
+	}
+
+	switch KeyAgreement {
+	case "sha-256":
+		key = []byte(Password) // that's it :D
+	case "x25519":
+		salt = make([]byte, 32) // salt here is public key of server
+		// at first generate a x25519 key pair (server also creates one meanwhile)
+		xKey, err := x25519.NewX25519()
+		if err != nil {
+			log.WithField("error", err.Error()).Error("cannot generate X25519 key pair")
+			return err
+		}
+		// read the servers public key
+		_, salt, err = srv.ReadMessage()
+		if err != nil {
+			log.WithField("error", err.Error()).Error("cannot get server's X25519 public key")
+			return err
+		}
+		// send the public key to server
+		err = srv.WriteMessage(websocket.BinaryMessage, xKey.PublicKey)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot send public key to server")
+			return err
+		}
+		// generate secret
+		key, err = xKey.GenerateSharedSecret(salt)
+		if err != nil {
+			log.WithField("error", err.Error()).Error("Cannot do the final key agreement")
+			return err
+		}
+	case "pbkdf2":
+		// server sends a 8 byte salt to us
+		_, salt, err = srv.ReadMessage()
+		if err != nil {
+			log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
+			return err
+		}
+		// generate shared key
+		key = pbkdf2.Key([]byte(Password), salt, 1024*16, 32, sha1.New)
+	case "scrypt":
+		// server sends a 8 byte salt to us
+		_, salt, err = srv.ReadMessage()
+		if err != nil {
+			log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
+			return err
+		}
+		// generate shared key
+		key, err = scrypt.Key([]byte(Password), salt, 1<<14, 8, 1, 32)
+	case "argon2":
+		// server sends a 16 byte salt to us
+		_, salt, err = srv.ReadMessage()
+		if err != nil {
+			log.Error("Cannot read salt from server. Invalid password? : ", err.Error())
+			return err
+		}
+		// generate shared key
+		key = argon2.IDKey([]byte(Password), salt, 10, 1<<14, 2, 32)
+	}
+	log.Trace("Key is ", base64.StdEncoding.EncodeToString(key))
+
+	log.Info("starting local TCP listener on ", InterfaceAddress+":"+Port)
+	listener, err := net.Listen("tcp", InterfaceAddress+":"+Port) // listen on the port and interface for connections
+	if err != nil {
+		return err
+	}
+
+	lastIndex := uint16(0)
+	connectionMap := make(map[uint16]*net.Conn)
+	// listen for incoming packets; server -> client must be decrypted
+	go func() {
+		var connId uint16
+		if Encryption == "xor" {
+			var message []byte
+			var i, nr int
+			for {
+				_, message, err = srv.ReadMessage() // read the message
+				if err != nil {
+					break
+				}
+				// check the mux options : byte: cmd, uint16: connection id
+				switch message[0] {
+				case muxFIN: // close connection
+					connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
+					(*connectionMap[connId]).Close()
+					continue
+				case muxPSH: // push data
+					connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
+					// just continue in loop
+				}
+
+				message = message[3:]
+				nr = len(message)
+				for i = 0; i < nr; i++ { // decrypt
+					message[i] ^= key[i%32]
+				}
+
+				_, err = (*connectionMap[connId]).Write(message) // send to proxy
+				if err != nil {
+					break
+				}
+			}
+		} else {
+			var c cipher.AEAD
+			var plainText []byte
+			if Encryption == "aes" {
+				block, err := aes.NewCipher(key)
+				if err != nil {
+					return
+				}
+				c, err = cipher.NewGCM(block)
+				if err != nil {
+					return
+				}
+			} else { // chacha
+				c, err = chacha20poly1305.New(key)
+				if err != nil {
+					return
+				}
+			}
+			for {
+				_, message, err := srv.ReadMessage()
+				if err != nil {
+					break
+				}
+
+				// check mux
+				switch message[0] {
+				case muxFIN: // close connection
+					connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
+					(*connectionMap[connId]).Close()
+					continue
+				case muxPSH: // push data
+					connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
+					// just continue in loop
+				}
+				message = message[3:]
+				plainText, err = c.Open(nil, message[:12], message[12:], nil)
+				if err != nil {
+					log.WithFields(log.Fields{
+						"src":   srv.RemoteAddr(),
+						"dest":  (*connectionMap[connId]).RemoteAddr(),
+						"error": err.Error(),
+					}).Error("Error on decrypting data")
+					break
+				}
+				_, err = (*connectionMap[connId]).Write(plainText)
+				if err != nil {
+					break
+				}
+			}
+		}
+	}()
+
+	for {
+		lastIndex++
+		local, err := listener.Accept() // accept incoming connections
+		if err != nil {
+			log.WithFields(log.Fields{
+				"from":  local.RemoteAddr(),
+				"error": err.Error(),
+			}).Error("Could not accept an incoming connection")
+			continue
+		}
+		log.WithFields(log.Fields{
+			"from": local.RemoteAddr(),
+			"id":   lastIndex,
+		}).Debug("accepting a connection")
+
+		// client -> server; Must be encrypted
+		go func(conn net.Conn, index uint16) {
+			byteIndex := make([]byte, 2)
+			binary.LittleEndian.PutUint16(byteIndex, index)
+			pushPacket := []byte{muxPSH, byteIndex[0], byteIndex[1]}
+			var innerError error
+			defer log.WithField("conn", conn.RemoteAddr()).Debug("closing local connection")
+			defer conn.Close()
+			defer srv.WriteMessage(websocket.BinaryMessage, []byte{muxFIN, byteIndex[0], byteIndex[1]}) // terminate mux
+			// send muxSYC
+			connectionMap[index] = &conn
+			innerError = srv.WriteMessage(websocket.BinaryMessage, []byte{muxSYC})
+			if innerError != nil {
+				log.Error("cannot send mux hello to server")
+				return
+			}
+			// start transferring data
+			var nr, i int
+			buf := make([]byte, BufferSize) // this is only used in reading from proxy
+			if Encryption == "xor" {        // this is only for performance. Once for all define if you we are going to use AEAD interface or xor
+				for {
+					nr, innerError = conn.Read(buf) // read from proxy
+					if nr > 0 {
+						for i = 0; i < nr; i++ { // encrypt
+							buf[i] ^= key[i%32]
+						}
+						// add mux
+						buf = append(pushPacket, buf...)
+						innerError = srv.WriteMessage(websocket.BinaryMessage, buf[:nr+3]) // send to client
+					}
+					if innerError != nil {
+						if innerError == io.EOF {
+							innerError = nil
+						}
+						break
+					}
+				}
+			} else {
+				// ready encryption stuff
+				var c cipher.AEAD
+				var cipherText []byte
+				nonce := make([]byte, 12)
+				if Encryption == "aes" {
+					block, err := aes.NewCipher(key)
+					if err != nil {
+						return
+					}
+					c, err = cipher.NewGCM(block)
+					if err != nil {
+						return
+					}
+				} else { // chacha
+					c, err = chacha20poly1305.New(key)
+					if err != nil {
+						return
+					}
+				}
+				// start transfer
+				var finalPacket []byte
+				for {
+					nr, innerError = conn.Read(buf)
+					if nr > 0 {
+						_, _ = rand.Read(nonce)
+						cipherText = c.Seal(nil, nonce, buf[:nr], nil)   // encrypt data
+						finalPacket = make([]byte, len(cipherText)+3+12) // add nonce and mux
+						copy(finalPacket, pushPacket)
+						copy(finalPacket[3:], nonce)
+						copy(finalPacket[3+12:], cipherText)
+						innerError = srv.WriteMessage(websocket.BinaryMessage, finalPacket) // send to client
+					}
+					if innerError != nil {
+						if innerError == io.EOF {
+							innerError = nil
+						}
+						break
+					}
+				}
+			}
+		}(local, lastIndex)
 	}
 }
