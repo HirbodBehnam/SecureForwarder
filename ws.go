@@ -619,6 +619,7 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 			case muxFIN: // close connection
 				connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
 				(*connectionMap[connId]).Close()
+				log.WithField("id", connId).Debug("got muxFin")
 				continue
 			case muxPSH: // push data
 				connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
@@ -1025,6 +1026,7 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 				case muxFIN: // close connection
 					connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
 					(*connectionMap[connId]).Close()
+					log.WithField("id", connId).Debug("got muxFin")
 					continue
 				case muxPSH: // push data
 					connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
@@ -1063,6 +1065,7 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 			for {
 				_, message, err := srv.ReadMessage()
 				if err != nil {
+					log.Error("Error on read message: ", err.Error())
 					break
 				}
 
@@ -1071,7 +1074,7 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 				case muxFIN: // close connection
 					connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
 					(*connectionMap[connId]).Close()
-					log.WithField("id", connId).Println("got muxFin")
+					log.WithField("id", connId).Debug("got muxFin")
 					continue
 				case muxPSH: // push data
 					connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
@@ -1089,7 +1092,12 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 				}
 				_, err = (*connectionMap[connId]).Write(plainText)
 				if err != nil {
-					break
+					// shall i send muxFIN?
+					log.WithFields(log.Fields{
+						"src":   srv.RemoteAddr(),
+						"dest":  (*connectionMap[connId]).RemoteAddr(),
+						"error": err.Error(),
+					}).Warn("error on writing data")
 				}
 			}
 		}
@@ -1119,7 +1127,10 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 			defer log.WithField("conn", conn.RemoteAddr()).Debug("closing local connection")
 			defer conn.Close()
 			defer func() {
-				log.WithField("id", index).Debug("sending muxFin")
+				log.WithFields(log.Fields{
+					"err": innerError,
+					"id":  index,
+				}).Debug("sending muxFin")
 				mutex.Lock()
 				_ = srv.WriteMessage(websocket.BinaryMessage, []byte{muxFIN, byteIndex[0], byteIndex[1]}) // terminate mux
 				mutex.Unlock()
