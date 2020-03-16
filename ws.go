@@ -445,27 +445,34 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 	// now start the mux server and listen to connections
 	// packets are like this: 1byte cmd + 2byte id
 	lastIndex := uint16(0)
-	connectionMap := make(map[uint16]*net.Conn)
+	connectionMap := make(map[uint16]net.Conn)
 	mutex := sync.Mutex{}
 
 	// define server -> client function
 	ServerToClient := func(myIndex uint16) {
+		var innerError error
 		proxy := connectionMap[myIndex]
 		indexByte := make([]byte, 2)
 		binary.LittleEndian.PutUint16(indexByte, myIndex)
 		muxPacket := []byte{muxPSH, indexByte[0], indexByte[1]}
 		defer func() {
-			log.WithField("id", myIndex).Debug("sending muxFin")
+			if innerError == nil {
+				log.WithField("id", myIndex).Debug("sending muxFin")
+			} else {
+				log.WithFields(log.Fields{
+					"error": innerError,
+					"id":    myIndex,
+				}).Debug("sending muxFin")
+			}
 			mutex.Lock()
 			_ = conn.WriteMessage(websocket.BinaryMessage, []byte{muxFIN, indexByte[0], indexByte[1]})
 			mutex.Unlock()
 		}()
 		var nr, i int
-		var innerError error
 		buf := make([]byte, BufferSize) // this is only used in reading from proxy
 		if Encryption == "xor" {        // this is only for performance. Once for all define if you we are going to use AEAD interface or xor
 			for {
-				nr, innerError = (*proxy).Read(buf) // read from proxy
+				nr, innerError = proxy.Read(buf) // read from proxy
 				if nr > 0 {
 					for i = 0; i < nr; i++ { // encrypt
 						buf[i] ^= key[i%32]
@@ -506,7 +513,7 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 			// start transfer
 			var finalPacket []byte
 			for {
-				nr, innerError = (*proxy).Read(buf)
+				nr, innerError = proxy.Read(buf)
 				if nr > 0 {
 					_, _ = rand.Read(nonce)
 					cipherText = c.Seal(nil, nonce, buf[:nr], nil)   // encrypt data
@@ -529,7 +536,6 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// start transfer
-	//go ServerToClient(0)
 
 	// client -> server ; must be decrypted
 	var connId uint16
@@ -552,13 +558,13 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 					log.Error("Cannot dial ", To, ": ", err.Error())
 					continue
 				}
-				connectionMap[lastIndex] = &newProxy
+				connectionMap[lastIndex] = newProxy
 				// start a listener for this proxy
 				go ServerToClient(lastIndex)
 				continue
 			case muxFIN: // close connection
 				connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
-				(*connectionMap[connId]).Close()
+				connectionMap[connId].Close()
 				log.WithField("id", connId).Println("got muxFin")
 				continue
 			case muxPSH: // push data
@@ -572,7 +578,7 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 				message[i] ^= key[i%32]
 			}
 
-			_, err = (*connectionMap[connId]).Write(message) // send to proxy
+			_, err = connectionMap[connId].Write(message) // send to proxy
 			if err != nil {
 				break
 			}
@@ -606,19 +612,19 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 			case muxSYC: // new connection
 				lastIndex++ // last index will increase no matter if the connection is ok or not
 				// dial a new connection and save it
-				log.WithField("index", lastIndex).Trace("new mux session")
+				log.WithField("index", lastIndex).Debug("new mux session")
 				newProxy, err := net.Dial("tcp", To)
 				if err != nil {
 					log.Error("Cannot dial ", To, ": ", err.Error())
 					continue
 				}
-				connectionMap[lastIndex] = &newProxy
+				connectionMap[lastIndex] = newProxy
 				// start a listener for this proxy
 				go ServerToClient(lastIndex)
 				continue
 			case muxFIN: // close connection
 				connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
-				(*connectionMap[connId]).Close()
+				connectionMap[connId].Close()
 				log.WithField("id", connId).Debug("got muxFin")
 				continue
 			case muxPSH: // push data
@@ -631,19 +637,20 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				log.WithFields(log.Fields{
 					"src":   conn.RemoteAddr(),
-					"dest":  (*connectionMap[connId]).RemoteAddr(),
+					"dest":  connectionMap[connId].RemoteAddr(),
 					"error": err.Error(),
 				}).Error("Error on decrypting data")
 				break
 			}
-			_, err = (*connectionMap[connId]).Write(plainText)
+			_, err = connectionMap[connId].Write(plainText)
 			if err != nil {
-				break
+				log.WithField("error", err.Error()).Debug("cannot write to connection")
+				continue
 			}
 		}
 	}
 
-	if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+	if err != nil {
 		log.WithField("error", err.Error()).Debug("Error on copy (client -> server)")
 	}
 }
@@ -1008,7 +1015,7 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 	}
 
 	lastIndex := uint16(0)
-	connectionMap := make(map[uint16]*net.Conn)
+	connectionMap := make(map[uint16]net.Conn)
 	mutex := sync.Mutex{}
 	// listen for incoming packets; server -> client must be decrypted
 	go func() {
@@ -1026,7 +1033,7 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 				switch message[0] {
 				case muxFIN: // close connection
 					connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
-					(*connectionMap[connId]).Close()
+					connectionMap[connId].Close()
 					log.WithField("id", connId).Debug("got muxFin")
 					continue
 				case muxPSH: // push data
@@ -1040,7 +1047,7 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 					message[i] ^= key[i%32]
 				}
 
-				_, err = (*connectionMap[connId]).Write(message) // send to proxy
+				_, err = connectionMap[connId].Write(message) // send to proxy
 				if err != nil {
 					break
 				}
@@ -1074,7 +1081,7 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 				switch message[0] {
 				case muxFIN: // close connection
 					connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
-					(*connectionMap[connId]).Close()
+					connectionMap[connId].Close()
 					log.WithField("id", connId).Debug("got muxFin")
 					continue
 				case muxPSH: // push data
@@ -1086,17 +1093,17 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 				if err != nil {
 					log.WithFields(log.Fields{
 						"src":   srv.RemoteAddr(),
-						"dest":  (*connectionMap[connId]).RemoteAddr(),
+						"dest":  connectionMap[connId].RemoteAddr(),
 						"error": err.Error(),
 					}).Error("Error on decrypting data")
 					break
 				}
-				_, err = (*connectionMap[connId]).Write(plainText)
+				_, err = connectionMap[connId].Write(plainText)
 				if err != nil {
 					// shall i send muxFIN?
 					log.WithFields(log.Fields{
 						"src":   srv.RemoteAddr(),
-						"dest":  (*connectionMap[connId]).RemoteAddr(),
+						"dest":  connectionMap[connId].RemoteAddr(),
 						"error": err.Error(),
 					}).Warn("error on writing data")
 				}
@@ -1137,7 +1144,7 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 				mutex.Unlock()
 			}()
 			// send muxSYC
-			connectionMap[index] = &conn
+			connectionMap[index] = conn
 			mutex.Lock()
 			innerError = srv.WriteMessage(websocket.BinaryMessage, []byte{muxSYC})
 			mutex.Unlock()
