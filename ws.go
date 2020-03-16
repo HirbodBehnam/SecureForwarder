@@ -444,7 +444,6 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 
 	// now start the mux server and listen to connections
 	// packets are like this: 1byte cmd + 2byte id
-	lastIndex := uint16(0)
 	connectionMap := make(map[uint16]net.Conn)
 	mutex := sync.Mutex{}
 
@@ -548,29 +547,26 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			// check the mux options : byte: cmd, uint16: connection id
+			connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
 			switch message[0] {
 			case muxSYC: // new connection
-				lastIndex++ // last index will increase no matter if the connection is ok or not
 				// dial a new connection and save it
-				log.WithField("index", lastIndex).Trace("new mux session")
+				log.WithField("index", connId).Trace("new mux session")
 				newProxy, err := net.Dial("tcp", To)
 				if err != nil {
 					log.Error("Cannot dial ", To, ": ", err.Error())
 					continue
 				}
-				connectionMap[lastIndex] = newProxy
+				connectionMap[connId] = newProxy
 				// start a listener for this proxy
-				go ServerToClient(lastIndex)
+				go ServerToClient(connId)
 				continue
 			case muxFIN: // close connection
-				connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
 				connectionMap[connId].Close()
 				log.WithField("id", connId).Println("got muxFin")
 				continue
-			case muxPSH: // push data
-				connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
-				// just continue in loop
 			}
+			// muxPSH
 
 			message = message[3:]
 			nr = len(message)
@@ -608,28 +604,24 @@ func WebsocketBaseMux(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// check mux
+			connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
 			switch message[0] {
 			case muxSYC: // new connection
-				lastIndex++ // last index will increase no matter if the connection is ok or not
 				// dial a new connection and save it
-				log.WithField("index", lastIndex).Debug("new mux session")
+				log.WithField("index", connId).Debug("new mux session")
 				newProxy, err := net.Dial("tcp", To)
 				if err != nil {
 					log.Error("Cannot dial ", To, ": ", err.Error())
 					continue
 				}
-				connectionMap[lastIndex] = newProxy
+				connectionMap[connId] = newProxy
 				// start a listener for this proxy
-				go ServerToClient(lastIndex)
+				go ServerToClient(connId)
 				continue
 			case muxFIN: // close connection
-				connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
 				connectionMap[connId].Close()
 				log.WithField("id", connId).Debug("got muxFin")
 				continue
-			case muxPSH: // push data
-				connId = binary.LittleEndian.Uint16(message[1:]) // 3 to n bytes are ignored
-				// just continue in loop
 			}
 
 			message = message[3:]
@@ -1112,7 +1104,6 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 	}()
 
 	for {
-		lastIndex++
 		local, err := listener.Accept() // accept incoming connections
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -1121,6 +1112,7 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 			}).Error("Could not accept an incoming connection")
 			continue
 		}
+		lastIndex++
 		log.WithFields(log.Fields{
 			"from": local.RemoteAddr(),
 			"id":   lastIndex,
@@ -1146,7 +1138,7 @@ func WebsocketListenClientMux(serverUrl url.URL) error {
 			// send muxSYC
 			connectionMap[index] = conn
 			mutex.Lock()
-			innerError = srv.WriteMessage(websocket.BinaryMessage, []byte{muxSYC})
+			innerError = srv.WriteMessage(websocket.BinaryMessage, []byte{muxSYC, byteIndex[0], byteIndex[1]})
 			mutex.Unlock()
 			if innerError != nil {
 				log.Error("cannot send mux hello to server")
