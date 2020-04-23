@@ -129,7 +129,7 @@ Key size 2048
 54.983ms
 ```
 
-and I ran one one my mobile (Huawei Mate 10) using Termux and Go 13.8
+and I ran one on my mobile (Huawei Mate 10) using Termux and Go 13.8
 ```text
 Key size 2048
 ========= sha 256 =========
